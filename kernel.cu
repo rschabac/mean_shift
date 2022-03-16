@@ -14,28 +14,28 @@
 
 #include "kdtree.h"
 struct Point {
-    float r, g, b, x, y;
+    float r, g, b, row, col;
 
-    Point(float p1, float p2, float p3, float p4, float p5) {
+    __host__ __device__ Point(float p1, float p2, float p3, float p4, float p5) {
         r = p1;
         g = p2;
         b = p3;
-        x = p4;
-        y = p5;
+        row = p4;
+        col = p5;
     }
-	float* operator[](int i)  {
+	__host__ __device__ float* operator[](int i)  {
 		switch(i) {
 		case 0: return &this->r;
 		case 1: return &this->g;
 		case 2: return &this->b;
-		case 3: return &this->x;
-		case 4: return &this->y;
+		case 3: return &this->row;
+		case 4: return &this->col;
 		default: assert(0);
 		}
 	}
-	float distance_squared(Point *other) {
+	__host__ __device__ float distance_squared(Point *other) {
 		float delta_squared = 0;
-		for (int i = 5; i < 5; i++) {
+		for (int i = 0; i < 5; i++) {
 			delta_squared += (*(*this)[i] - *(*other)[i]) * (*(*this)[i] - *(*other)[i]);
 		}
 		return delta_squared;
@@ -55,20 +55,13 @@ struct kdres* neighbors(struct kdtree* kd, Point p, float radius) {
 //Still have to call neighbors before, and kd_res_free after this
 #define KD_FOR(point, set) for (kd_res_itemf(set, &point.r); !kd_res_end(set); kd_res_next(set), kd_res_itemf(set, &point.r))
 
-cudaError_t addWithCuda(int *c, const int *a, const int *b, unsigned int size);
-
-__global__ void addKernel(int *c, const int *a, const int *b)
-{
-    int i = threadIdx.x;
-    c[i] = a[i] + b[i];
-}
-
-char * cpu_version(const char* image_data, int rows, int cols, float radius, float convergence_threshold) {
-    char* result = (char*)malloc(rows * cols * 3);
+void color_result(const unsigned char *, unsigned char *, int, int, int);
+unsigned char * cpu_version(const unsigned char* image_data, int rows, int cols, float radius, float convergence_threshold) {
+    unsigned char* result = (unsigned char*)malloc(rows * cols * 3);
     struct kdtree* kd = kd_create(5);
     for (int r = 0; r < rows; r++) {
         for (int c = 0; c < cols; c++) {
-            const char* const base_of_pixel = &image_data[(r * rows + cols) * 3];
+            const unsigned char* const base_of_pixel = &image_data[(r * cols + c) * 3];
             add_point(kd, Point(base_of_pixel[0], base_of_pixel[1], base_of_pixel[2], r, c));
         }
     }
@@ -85,7 +78,7 @@ char * cpu_version(const char* image_data, int rows, int cols, float radius, flo
 	cluster_convergences.reserve(256);
 	for (int r = 0; r < rows; r++) {
 		for (int c = 0; c < cols; c++) {
-			const char* const base_of_pixel = &image_data[(r * rows + cols) * 3];
+			const unsigned char* const base_of_pixel = &image_data[(r * cols + c) * 3];
 			Point centroid(base_of_pixel[0], base_of_pixel[1], base_of_pixel[2], r, c);
 			while(true) {
 				Point new_centroid(0,0,0,0,0);
@@ -93,7 +86,7 @@ char * cpu_version(const char* image_data, int rows, int cols, float radius, flo
 				Point temp;
 				KD_FOR(temp, near_points) {
 					for (int i = 0; i < 5; i++) {
-						*new_centroid[i] = *temp[i];
+						*new_centroid[i] += *temp[i];
 					}
 				}
 				int num_near_points = kd_res_size(near_points);
@@ -111,8 +104,8 @@ char * cpu_version(const char* image_data, int rows, int cols, float radius, flo
 			for (int i = 0; i < cluster_convergences.size(); i++) {
 				//two paths to the same center could have converged from opposite directions,
 				//so using 2 * convergence_threshold here.
-				if (cluster_convergences[i].distance_squared(&centroid) < 4 * convergence_threshold * convergence_threshold) {
-					//this point conerges to a centroid that has already been seen before
+				if (cluster_convergences[i].distance_squared(&centroid) <= 4 * convergence_threshold * convergence_threshold) {
+					//this point converges to a centroid that has already been seen before
 					cluster_id = i;
 					break;
 				}
@@ -125,21 +118,25 @@ char * cpu_version(const char* image_data, int rows, int cols, float radius, flo
 				cluster_convergences.push_back(centroid);
 				cluster_id = cluster_convergences.size() - 1;
 			}
-			result[(r * rows + cols) * 3] = cluster_id;
+			result[(r * cols + c) * 3] = cluster_id;
 		}
 	}
 	
 	//now compute average rgb for each cluster
-	const int num_clusters = cluster_convergences.size();
+	color_result(image_data, result, cluster_convergences.size(), rows, cols);
+	return result;
+}
+
+void color_result(const unsigned char *image_data, unsigned char *result, int num_clusters, int rows, int cols) {
 	std::vector<long long> average_rs(num_clusters),
 							average_gs(num_clusters),
 							average_bs(num_clusters);
 	std::vector<int> cluster_sizes(num_clusters);
 	for (int r = 0; r < rows; r++) {
 		for (int c = 0; c < cols; c++) {
-			int cluster_num = result[(r * rows + c) * 3];
+			int cluster_num = result[(r * cols + c) * 3];
 			cluster_sizes[cluster_num]++;
-			const char * const base_of_pixel = &image_data[(r * rows + c) * 3];
+			const unsigned char * const base_of_pixel = &image_data[(r * cols + c) * 3];
 			average_rs[cluster_num] += base_of_pixel[0];
 			average_gs[cluster_num] += base_of_pixel[1];
 			average_bs[cluster_num] += base_of_pixel[2];
@@ -152,132 +149,156 @@ char * cpu_version(const char* image_data, int rows, int cols, float radius, flo
 	}
 	for (int r = 0; r < rows; r++) {
 		for (int c = 0; c < cols; c++) {
-			char * const base_of_result_pixel = &result[(r * rows + c) * 3];
+			char unsigned * const base_of_result_pixel = &result[(r * cols + c) * 3];
 			int cluster_num = base_of_result_pixel[0];
 			base_of_result_pixel[0] = average_rs[cluster_num];
 			base_of_result_pixel[1] = average_gs[cluster_num];
 			base_of_result_pixel[2] = average_bs[cluster_num];
 		}
 	}
-	return result;
 }
-#define SEARCH_RADIUS 100
+
+__global__ void naive_kernel(const unsigned char *image, int rows, int cols, float radius, Point *centroids, float *deltas) {
+	Point new_centroid(0,0,0,0,0);
+	int num_neighbors = 0;
+	int c = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y * blockDim.y + threadIdx.y;
+	for (int d_r = floorf(-radius); d_r <= ceilf(radius); d_r++) {
+		float limit = sqrtf(radius * radius - d_r * d_r);
+		for (int d_c = floorf(-limit); d_c <= ceilf(limit); d_c++) {
+			int search_r = r + d_r, search_c = c + d_c;
+			if (search_r < 0 || search_r >= rows || search_c < 0 || search_c >= cols) {
+				continue;
+			}
+			const unsigned char* const base_of_pixel = &image[(search_r * cols + search_c) * 3];
+			Point potential_neighbor(base_of_pixel[0], base_of_pixel[1], base_of_pixel[2], search_r, search_c);
+			if (potential_neighbor.distance_squared(&centroids[r * cols + c]) <= radius * radius) {
+				num_neighbors++;
+				for (int i = 0; i < 5; i++) {
+					*new_centroid[i] += *potential_neighbor[i];
+				}
+			}
+		}
+	}
+	for (int i = 0; i < 5; i++) {
+		*new_centroid[i] /= num_neighbors;
+	}
+	float distance_squared = new_centroid.distance_squared(&centroids[r * cols + c]);
+	centroids[r * cols + c] = new_centroid;
+	deltas[r * cols + c] = distance_squared;
+}
+
+unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int cols, float radius, float convergence_threshold) {
+	unsigned char *result = (unsigned char*)malloc(rows * cols * 3);
+	cudaError_t err_code = cudaSuccess;
+	err_code = cudaSetDevice(0);
+	Point *host_centroids = (Point*)malloc(rows * cols * sizeof(Point));
+	for (int r = 0; r < rows; r++){
+		for (int c = 0; c < cols; c++) {
+			const unsigned char* const base_of_pixel = &image_data[(r * cols + c) * 3];
+			host_centroids[r * cols + c] = Point(base_of_pixel[0], base_of_pixel[1], base_of_pixel[2], r, c);
+		}
+	}
+	Point *dev_centroids = NULL;
+	err_code = cudaMalloc((void**)&dev_centroids, rows * cols * sizeof(Point));
+	err_code = cudaMemcpy(dev_centroids, host_centroids, rows * cols * sizeof(Point), cudaMemcpyHostToDevice);
+	
+	float *host_deltas = (float*)malloc(rows * cols * sizeof(float));
+	float *dev_deltas = NULL;
+	err_code = cudaMalloc((void**)&dev_deltas, rows * cols * sizeof(float));
+	
+	unsigned char *dev_image = NULL;
+	err_code = cudaMalloc((void**)&dev_image, rows * cols * 3);
+	err_code = cudaMemcpy(dev_image, image_data, rows * cols * 3, cudaMemcpyHostToDevice);
+	
+	/*
+	cudaDeviceProp info;
+	err_code = cudaGetDeviceProperties(&info, 0);
+	*/
+	while (true) {
+		//My device (NVIDIA GeForce GTX 1660) has a max of 1024 threads per block
+		dim3 block_dims(32, 32);
+		dim3 grid_dims((int)ceil(cols / (float) 32), (int)ceil(rows / (float)32));
+		naive_kernel<<<grid_dims, block_dims>>>(dev_image, rows, cols, radius, dev_centroids, dev_deltas);
+		
+		err_code = cudaGetLastError(); //errors from launching the kernel
+		err_code = cudaDeviceSynchronize(); //errors that happened during the kernel launch
+		
+		err_code = cudaMemcpy(host_deltas, dev_deltas, rows * cols * sizeof(float), cudaMemcpyDeviceToHost);
+		float max_delta = 0.0f;
+		//should really do this with another kernel
+		for (int r = 0; r < rows; r++) {
+			for (int c = 0; c < cols; c++) {
+				if (host_deltas[r * cols + c] > max_delta) {
+					max_delta = host_deltas[r * cols + c];
+				}
+			}
+		}
+		if (max_delta <= convergence_threshold) {
+			break;
+		}
+	}
+	
+	err_code = cudaMemcpy(host_centroids, dev_centroids, rows * cols * sizeof(float), cudaMemcpyDeviceToHost);
+	
+	std::vector<Point> cluster_convergences;
+	cluster_convergences.reserve(256);
+	for (int r = 0; r < rows; r++) {
+		for (int c = 0; c < cols; c++) {
+			int cluster_id = -1;
+			for (int i = 0; i < cluster_convergences.size(); i++) {
+				if (cluster_convergences[i].distance_squared(&host_centroids[r * cols + c]) <= 4 * convergence_threshold * convergence_threshold) {
+					cluster_id = i;
+					break;
+				}
+			}
+			if (cluster_id == -1) {
+				if (cluster_convergences.size() == 256) {
+					fprintf(stderr, "ERROR: more than 256 clusters identified, try tweaking CONVERGENCE_THRESHOLD and SEARCH_RADIUS\n");
+					assert(0);
+				}
+				cluster_convergences.push_back(host_centroids[r * cols + c]);
+				cluster_id = cluster_convergences.size() - 1;
+			}
+			result[(r * cols + c) * 3] = cluster_id;
+		}
+	}
+	color_result(image_data, result, cluster_convergences.size(), rows, cols);
+	
+	free(host_centroids);
+	cudaFree(dev_centroids);
+	free(host_deltas);
+	cudaFree(dev_deltas);
+	cudaFree(dev_image);
+	return result;
+	
+}
+#define SEARCH_RADIUS 50
 #define CONVERGENCE_THRESHOLD 0
 int main()
 {
     int rows, cols, channels;
-    char* image_data = (char*)stbi_load("test_images/dapper_lad.jpg", &cols, &rows, &channels, 3);
+    unsigned char* image_data = (unsigned char*)stbi_load("test_images/dapper_lad_smaller.jpg", &cols, &rows, &channels, 3);
     if (!image_data) {
         fprintf(stderr, "Error reading image: %s", stbi_failure_reason());
         return -1;
     }
-    char * cpu_result = cpu_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD);
-    stbi_write_png("output.png", cols, rows, 3, cpu_result, 0);
+    unsigned char * cpu_result = cpu_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD);
+    stbi_write_png("cpu_output.png", cols, rows, 3, cpu_result, 0);
     free(cpu_result);
-    
-    stbi_image_free(image_data);
-    const int arraySize = 5;
-    const int a[arraySize] = { 1, 2, 3, 4, 5 };
-    const int b[arraySize] = { 10, 20, 30, 40, 50 };
-    int c[arraySize] = { 0 };
 
-    // Add vectors in parallel.
-    cudaError_t cudaStatus = addWithCuda(c, a, b, arraySize);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "addWithCuda failed!");
-        return 1;
-    }
-
-    printf("{1,2,3,4,5} + {10,20,30,40,50} = {%d,%d,%d,%d,%d}\n",
-        c[0], c[1], c[2], c[3], c[4]);
+	unsigned char * gpu_result = naive_GPU_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD);
+	stbi_write_png("gpu_output.png", cols, rows, 3, gpu_result, 0);
+	free(gpu_result);
+	
+	stbi_image_free(image_data);
 
     // cudaDeviceReset must be called before exiting in order for profiling and
     // tracing tools such as Nsight and Visual Profiler to show complete traces.
-    cudaStatus = cudaDeviceReset();
+    cudaError_t cudaStatus = cudaDeviceReset();
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaDeviceReset failed!");
         return 1;
     }
 
     return 0;
-}
-
-// Helper function for using CUDA to add vectors in parallel.
-cudaError_t addWithCuda(int *c, const int *a, const int *b, unsigned int size)
-{
-    int *dev_a = 0;
-    int *dev_b = 0;
-    int *dev_c = 0;
-    cudaError_t cudaStatus;
-
-    // Choose which GPU to run on, change this on a multi-GPU system.
-    cudaStatus = cudaSetDevice(0);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
-        goto Error;
-    }
-
-    // Allocate GPU buffers for three vectors (two input, one output)    .
-    cudaStatus = cudaMalloc((void**)&dev_c, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
-
-    cudaStatus = cudaMalloc((void**)&dev_a, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
-
-    cudaStatus = cudaMalloc((void**)&dev_b, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
-
-    // Copy input vectors from host memory to GPU buffers.
-    cudaStatus = cudaMemcpy(dev_a, a, size * sizeof(int), cudaMemcpyHostToDevice);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
-
-    cudaStatus = cudaMemcpy(dev_b, b, size * sizeof(int), cudaMemcpyHostToDevice);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
-
-    // Launch a kernel on the GPU with one thread for each element.
-    addKernel<<<1, size>>>(dev_c, dev_a, dev_b);
-
-    // Check for any errors launching the kernel
-    cudaStatus = cudaGetLastError();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "addKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
-        goto Error;
-    }
-    
-    // cudaDeviceSynchronize waits for the kernel to finish, and returns
-    // any errors encountered during the launch.
-    cudaStatus = cudaDeviceSynchronize();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching addKernel!\n", cudaStatus);
-        goto Error;
-    }
-
-    // Copy output vector from GPU buffer to host memory.
-    cudaStatus = cudaMemcpy(c, dev_c, size * sizeof(int), cudaMemcpyDeviceToHost);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
-
-Error:
-    cudaFree(dev_c);
-    cudaFree(dev_a);
-    cudaFree(dev_b);
-    
-    return cudaStatus;
 }

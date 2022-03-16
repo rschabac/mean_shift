@@ -1,4 +1,5 @@
 x64/
 .vs/
-output.png
-output.jpg
+output.*
+cpu_output.*
+gpu_output.*

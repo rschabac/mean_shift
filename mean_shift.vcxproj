@@ -65,6 +65,8 @@
       <AdditionalCompilerOptions>
       </AdditionalCompilerOptions>
       <Include>D:\cs677\opencv\build\include</Include>
+      <GenerateLineInfo>false</GenerateLineInfo>
+      <InterleaveSourceInPTX>true</InterleaveSourceInPTX>
     </CudaCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">

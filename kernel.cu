@@ -75,12 +75,15 @@ unsigned char * cpu_version(const unsigned char* image_data, int rows, int cols,
 	once all are clustered, find average rgb over each cluster, then update colors appropriately
 	*/
 	std::vector<Point> cluster_convergences;
+	int max_iters = 0;
 	cluster_convergences.reserve(256);
 	for (int r = 0; r < rows; r++) {
 		for (int c = 0; c < cols; c++) {
 			const unsigned char* const base_of_pixel = &image_data[(r * cols + c) * 3];
 			Point centroid(base_of_pixel[0], base_of_pixel[1], base_of_pixel[2], r, c);
+			int iters = 0;
 			while(true) {
+				iters++;
 				Point new_centroid(0,0,0,0,0);
 				struct kdres* near_points = neighbors(kd, centroid, radius);
 				Point temp;
@@ -99,6 +102,9 @@ unsigned char * cpu_version(const unsigned char* image_data, int rows, int cols,
 				if (delta_squared <= convergence_threshold * convergence_threshold) {
 					break;
 				}
+			}
+			if (iters > max_iters) {
+				max_iters = iters;
 			}
 			int cluster_id = -1;
 			for (int i = 0; i < cluster_convergences.size(); i++) {
@@ -121,6 +127,7 @@ unsigned char * cpu_version(const unsigned char* image_data, int rows, int cols,
 			result[(r * cols + c) * 3] = cluster_id;
 		}
 	}
+	fprintf(stderr, "Max iters in CPU version was %d\n", max_iters);
 	
 	//now compute average rgb for each cluster
 	color_result(image_data, result, cluster_convergences.size(), rows, cols);
@@ -158,21 +165,35 @@ void color_result(const unsigned char *image_data, unsigned char *result, int nu
 	}
 }
 
-__global__ void naive_kernel(const unsigned char *image, int rows, int cols, float radius, Point *centroids, float *deltas) {
-	Point new_centroid(0,0,0,0,0);
+
+
+__host__ __device__ void naive_kernel_internals(const unsigned char* image, int rows, int cols, int r, int c, float radius, Point* centroids, float* deltas) {
+	if (r >= rows || c >= cols) {
+		return;
+	}
+	//if (deltas[r * cols + c] < 0.1f) {
+	//	//HOST ONLY
+	//	return;
+	//}
+	Point new_centroid(0, 0, 0, 0, 0);
 	int num_neighbors = 0;
-	int c = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y * blockDim.y + threadIdx.y;
-	for (int d_r = floorf(-radius); d_r <= ceilf(radius); d_r++) {
-		float limit = sqrtf(radius * radius - d_r * d_r);
-		for (int d_c = floorf(-limit); d_c <= ceilf(limit); d_c++) {
-			int search_r = r + d_r, search_c = c + d_c;
+	Point* this_centroid = &centroids[r * cols + c];
+	const float radius_squared = radius * radius;
+	for (int d_r = floorf(-radius) - 1; d_r <= ceilf(radius) + 1; d_r++) {
+		//float limit = sqrtf(radius * radius - d_r * d_r);
+		//for (int d_c = floorf(-limit); d_c <= ceilf(limit); d_c++) {
+		for (int d_c = floorf(-radius) - 1; d_c <= ceilf(radius) + 1; d_c++) {
+			if (d_r * d_r + d_c * d_c > radius_squared) continue;
+			int search_r = floorf(this_centroid->row + d_r), search_c = floorf(this_centroid->col + d_c);
 			if (search_r < 0 || search_r >= rows || search_c < 0 || search_c >= cols) {
 				continue;
 			}
 			const unsigned char* const base_of_pixel = &image[(search_r * cols + search_c) * 3];
 			Point potential_neighbor(base_of_pixel[0], base_of_pixel[1], base_of_pixel[2], search_r, search_c);
-			if (potential_neighbor.distance_squared(&centroids[r * cols + c]) <= radius * radius) {
+			float distance_squared = potential_neighbor.distance_squared(this_centroid);
+			if (distance_squared <= radius_squared) {
 				num_neighbors++;
+				//fprintf(stderr, "pixel at r=%d, c=%d is a neighbor of centroid r=%f, c=%f\n", search_r, search_c, this_centroid->row, this_centroid->col);
 				for (int i = 0; i < 5; i++) {
 					*new_centroid[i] += *potential_neighbor[i];
 				}
@@ -182,9 +203,124 @@ __global__ void naive_kernel(const unsigned char *image, int rows, int cols, flo
 	for (int i = 0; i < 5; i++) {
 		*new_centroid[i] /= num_neighbors;
 	}
-	float distance_squared = new_centroid.distance_squared(&centroids[r * cols + c]);
-	centroids[r * cols + c] = new_centroid;
+	float distance_squared = new_centroid.distance_squared(this_centroid);
+	*this_centroid = new_centroid;
+	/*if (deltas[r * cols + c] > distance_squared) {
+		fprintf(stderr, "delta for r=%d, c=%d got bigger, was %f, now is %f\n", r, c, deltas[r * cols + c], distance_squared);
+	}*/
 	deltas[r * cols + c] = distance_squared;
+}
+
+__global__ void naive_kernel(const unsigned char *image, int rows, int cols, float radius, Point *centroids, float *deltas) {
+	int c = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y * blockDim.y + threadIdx.y;
+	if (r >= rows || c >= cols) {
+		return;
+	}
+	//if (deltas[r * cols + c] < 0.1f) {
+	//	//HOST ONLY
+	//	return;
+	//}
+	Point new_centroid(0, 0, 0, 0, 0);
+	int num_neighbors = 0;
+	Point* this_centroid = &centroids[r * cols + c];
+	const float radius_squared = radius * radius;
+	for (int d_r = floorf(-radius) - 1; d_r <= ceilf(radius) + 1; d_r++) {
+		//float limit = sqrtf(radius * radius - d_r * d_r);
+		//for (int d_c = floorf(-limit); d_c <= ceilf(limit); d_c++) {
+		for (int d_c = floorf(-radius) - 1; d_c <= ceilf(radius) + 1; d_c++) {
+			if (d_r * d_r + d_c * d_c > radius_squared) continue;
+			int search_r = floorf(this_centroid->row + d_r), search_c = floorf(this_centroid->col + d_c);
+			if (search_r < 0 || search_r >= rows || search_c < 0 || search_c >= cols) {
+				continue;
+			}
+			const unsigned char* const base_of_pixel = &image[(search_r * cols + search_c) * 3];
+			Point potential_neighbor(base_of_pixel[0], base_of_pixel[1], base_of_pixel[2], search_r, search_c);
+			float distance_squared = potential_neighbor.distance_squared(this_centroid);
+			if (distance_squared <= radius_squared) {
+				num_neighbors++;
+				//fprintf(stderr, "pixel at r=%d, c=%d is a neighbor of centroid r=%f, c=%f\n", search_r, search_c, this_centroid->row, this_centroid->col);
+				for (int i = 0; i < 5; i++) {
+					*new_centroid[i] += *potential_neighbor[i];
+				}
+			}
+		}
+	}
+	for (int i = 0; i < 5; i++) {
+		*new_centroid[i] /= num_neighbors;
+	}
+	float distance_squared = new_centroid.distance_squared(this_centroid);
+	*this_centroid = new_centroid;
+	/*if (deltas[r * cols + c] > distance_squared) {
+		fprintf(stderr, "delta for r=%d, c=%d got bigger, was %f, now is %f\n", r, c, deltas[r * cols + c], distance_squared);
+	}*/
+	deltas[r * cols + c] = distance_squared;
+}
+
+unsigned char* sequential_gpu_version(const unsigned char* image_data, int rows, int cols, float radius, float convergence_threshold) {
+	unsigned char *result = (unsigned char*)malloc(rows * cols * 3);
+	Point *centroids = (Point*)malloc(rows * cols * sizeof(Point));
+	for (int r = 0; r < rows; r++){
+		for (int c = 0; c < cols; c++) {
+			const unsigned char* const base_of_pixel = &image_data[(r * cols + c) * 3];
+			centroids[r * cols + c] = Point(base_of_pixel[0], base_of_pixel[1], base_of_pixel[2], r, c);
+		}
+	}
+	
+	float *deltas = (float*)malloc(rows * cols * sizeof(float));
+	for (int r = 0; r < rows; r++) {
+		for (int c = 0; c < cols; c++) {
+			deltas[r * cols + c] = INFINITY;
+		}
+	}
+	
+	int iters = 0;
+	while (true) {
+		fprintf(stderr, "starting iter %d\n", iters++);
+		for (int r = 0; r < rows; r++) {
+			for (int c = 0; c < cols; c++) {
+				naive_kernel_internals(image_data, rows, cols, r, c, radius, centroids, deltas);
+			}
+		}
+		float max_delta = 0.0f;
+		for (int r = 0; r < rows; r++) {
+			for (int c = 0; c < cols; c++) {
+				if (deltas[r * cols + c] > max_delta) {
+					max_delta = deltas[r * cols + c];
+				}
+			}
+		}
+		if (max_delta <= convergence_threshold) {
+			break;
+		}
+	}
+	
+	std::vector<Point> cluster_convergences;
+	cluster_convergences.reserve(256);
+	for (int r = 0; r < rows; r++) {
+		for (int c = 0; c < cols; c++) {
+			int cluster_id = -1;
+			for (int i = 0; i < cluster_convergences.size(); i++) {
+				if (cluster_convergences[i].distance_squared(&centroids[r * cols + c]) <= 4 * convergence_threshold * convergence_threshold) {
+					cluster_id = i;
+					break;
+				}
+			}
+			if (cluster_id == -1) {
+				if (cluster_convergences.size() == 256) {
+					fprintf(stderr, "ERROR: more than 256 clusters identified, try tweaking CONVERGENCE_THRESHOLD and SEARCH_RADIUS\n");
+					assert(0);
+				}
+				cluster_convergences.push_back(centroids[r * cols + c]);
+				cluster_id = cluster_convergences.size() - 1;
+			}
+			result[(r * cols + c) * 3] = cluster_id;
+		}
+	}
+	color_result(image_data, result, cluster_convergences.size(), rows, cols);
+	
+	free(deltas);
+	free(centroids);
+	return result;
 }
 
 unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int cols, float radius, float convergence_threshold) {
@@ -210,11 +346,15 @@ unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int
 	err_code = cudaMalloc((void**)&dev_image, rows * cols * 3);
 	err_code = cudaMemcpy(dev_image, image_data, rows * cols * 3, cudaMemcpyHostToDevice);
 	
-	/*
-	cudaDeviceProp info;
-	err_code = cudaGetDeviceProperties(&info, 0);
-	*/
+	/*Point* seq_centroids = (Point*)malloc(rows * cols * sizeof(Point));
+	float* seq_deltas = (float*)malloc(rows * cols * sizeof(Point));
+	{
+		memcpy(seq_centroids, host_centroids, rows * cols * sizeof(Point));
+	}*/
+
+	int iters = 0;
 	while (true) {
+		fprintf(stderr, "now starting iter %d\n", iters++);
 		//My device (NVIDIA GeForce GTX 1660) has a max of 1024 threads per block
 		dim3 block_dims(32, 32);
 		dim3 grid_dims((int)ceil(cols / (float) 32), (int)ceil(rows / (float)32));
@@ -224,6 +364,21 @@ unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int
 		err_code = cudaDeviceSynchronize(); //errors that happened during the kernel launch
 		
 		err_code = cudaMemcpy(host_deltas, dev_deltas, rows * cols * sizeof(float), cudaMemcpyDeviceToHost);
+		//cudaMemcpy(host_centroids, dev_centroids, rows * cols * sizeof(Point), cudaMemcpyDeviceToHost);
+		/*{ //just for comparing against sequential "kernel"
+			cudaMemcpy(host_centroids, dev_centroids, rows * cols * sizeof(Point), cudaMemcpyDeviceToHost);
+			for (int r = 0; r < rows; r++) {
+				for (int c = 0; c < cols; c++) {
+					naive_kernel_internals(image_data, rows, cols, r, c, radius, seq_centroids, seq_deltas);
+					if (memcmp(&host_centroids[r * cols + c], &seq_centroids[r * cols + c], sizeof(Point))) {
+						fprintf(stderr, "centroid for r=%d, c=%d does not match\n", r, c);
+					}
+					if (host_deltas[r * cols + c] != seq_deltas[r * cols + c]) {
+						fprintf(stderr, "delta for r=%d, c=%d does not match, seq = %f, dev = %f\n", r, c, seq_deltas[r * cols + c], host_deltas[r * cols + c]);
+					}
+				}
+			}
+		}*/
 		float max_delta = 0.0f;
 		//should really do this with another kernel
 		for (int r = 0; r < rows; r++) {
@@ -273,7 +428,7 @@ unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int
 	
 }
 #define SEARCH_RADIUS 50
-#define CONVERGENCE_THRESHOLD 0
+#define CONVERGENCE_THRESHOLD 10
 int main()
 {
     int rows, cols, channels;
@@ -285,6 +440,10 @@ int main()
     unsigned char * cpu_result = cpu_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD);
     stbi_write_png("cpu_output.png", cols, rows, 3, cpu_result, 0);
     free(cpu_result);
+
+	/*unsigned char* sequential_kernel_result = sequential_gpu_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD);
+	stbi_write_png("sequential_output.png", cols, rows, 3, sequential_kernel_result, 0);
+	free(sequential_kernel_result);*/
 
 	unsigned char * gpu_result = naive_GPU_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD);
 	stbi_write_png("gpu_output.png", cols, rows, 3, gpu_result, 0);

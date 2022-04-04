@@ -4,3 +4,4 @@ output.*
 cpu_output.*
 gpu_output.*
 sequential_output.*
+*.nvsettings

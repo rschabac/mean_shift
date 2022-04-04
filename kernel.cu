@@ -323,6 +323,39 @@ unsigned char* sequential_gpu_version(const unsigned char* image_data, int rows,
 	return result;
 }
 
+__global__ void max_in_groups(float* data, int n) {
+	__shared__ float block_data[2048];
+	unsigned short t_id = threadIdx.x;
+	unsigned global_block_start = blockIdx.x * 2048;
+	unsigned short local_offset = 2 * t_id;
+	//pad out the last block's block_data with zeros
+	if (global_block_start + local_offset < n) {
+		block_data[local_offset] = data[global_block_start + local_offset];
+		if (global_block_start + local_offset + 1 < n) {
+			block_data[local_offset + 1] = data[global_block_start + local_offset + 1];
+		}
+		else {
+			block_data[local_offset + 1] = 0.0f;
+		}
+	}
+	else {
+		block_data[local_offset] = 0.0f;
+		block_data[local_offset + 1] = 0.0f;
+	}
+
+	for (unsigned short stride = 1024; stride >= 1; stride >>= 1) {
+		__syncthreads();
+		if (t_id < stride) {
+			block_data[t_id] += max(block_data[t_id + stride], block_data[t_id]);
+		}
+	}
+
+	__syncthreads();
+	if (t_id == 0) {
+		data[global_block_start] = block_data[0];
+	}
+}
+
 unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int cols, float radius, float convergence_threshold) {
 	unsigned char *result = (unsigned char*)malloc(rows * cols * 3);
 	cudaError_t err_code = cudaSuccess;
@@ -363,8 +396,9 @@ unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int
 		err_code = cudaGetLastError(); //errors from launching the kernel
 		err_code = cudaDeviceSynchronize(); //errors that happened during the kernel launch
 		
-		err_code = cudaMemcpy(host_deltas, dev_deltas, rows * cols * sizeof(float), cudaMemcpyDeviceToHost);
-		//cudaMemcpy(host_centroids, dev_centroids, rows * cols * sizeof(Point), cudaMemcpyDeviceToHost);
+		//err_code = cudaMemcpy(host_deltas, dev_deltas, rows * cols * sizeof(float), cudaMemcpyDeviceToHost);
+		//load-bearing memcpy, do not remove
+		err_code = cudaMemcpy(host_centroids, dev_centroids, rows * cols * sizeof(Point), cudaMemcpyDeviceToHost);
 		/*{ //just for comparing against sequential "kernel"
 			cudaMemcpy(host_centroids, dev_centroids, rows * cols * sizeof(Point), cudaMemcpyDeviceToHost);
 			for (int r = 0; r < rows; r++) {
@@ -379,18 +413,22 @@ unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int
 				}
 			}
 		}*/
+		int blocks_necessary = (int)ceil((float)(rows * cols) / 2048.0f); //1024 is max threads per block
+		max_in_groups<<<blocks_necessary, 2048>>>(dev_deltas, rows * cols);
 		float max_delta = 0.0f;
-		//should really do this with another kernel
-		for (int r = 0; r < rows; r++) {
-			for (int c = 0; c < cols; c++) {
-				if (host_deltas[r * cols + c] > max_delta) {
-					max_delta = host_deltas[r * cols + c];
-				}
+		//Maybe it would be faster to make one big array here and just do one memcpy into that
+		for (int i = 0; i < rows * cols; i++) {
+			float temp;
+			cudaMemcpy(&temp, &dev_deltas[i], sizeof(float), cudaMemcpyDeviceToHost);
+			if (temp > max_delta) {
+				max_delta = temp;
 			}
 		}
-		if (max_delta <= convergence_threshold) {
+
+		if (max_delta < convergence_threshold) {
 			break;
 		}
+		
 	}
 	
 	err_code = cudaMemcpy(host_centroids, dev_centroids, rows * cols * sizeof(float), cudaMemcpyDeviceToHost);

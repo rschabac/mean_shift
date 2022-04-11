@@ -3,6 +3,8 @@
 #include "device_launch_parameters.h"
 
 #include <stdio.h>
+#include <chrono>
+#include <iostream>
 #include <vector>
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -43,9 +45,11 @@ struct Point {
     //somehow this makes Point be a POD type, which is important because c++ likes to do weird things
     Point() = default;
 };
-//simplest way to handle errors
+
 void add_point(struct kdtree* kd, Point p) {
-    assert(kd_insertf(kd, &p.r, NULL) == 0);
+	//simplest way to handle errors
+	auto result = kd_insertf(kd, &p.r, NULL);
+	assert(result == 0);
 }
 struct kdres* neighbors(struct kdtree* kd, Point p, float radius) {
     auto result = kd_nearest_rangef(kd, &p.r, radius);
@@ -56,7 +60,7 @@ struct kdres* neighbors(struct kdtree* kd, Point p, float radius) {
 #define KD_FOR(point, set) for (kd_res_itemf(set, &point.r); !kd_res_end(set); kd_res_next(set), kd_res_itemf(set, &point.r))
 
 void color_result(const unsigned char *, unsigned char *, int, int, int);
-unsigned char * cpu_version(const unsigned char* image_data, int rows, int cols, float radius, float convergence_threshold) {
+unsigned char * cpu_version(const unsigned char* image_data, int rows, int cols, float radius, float convergence_threshold, bool do_color) {
     unsigned char* result = (unsigned char*)malloc(rows * cols * 3);
     struct kdtree* kd = kd_create(5);
     for (int r = 0; r < rows; r++) {
@@ -78,6 +82,7 @@ unsigned char * cpu_version(const unsigned char* image_data, int rows, int cols,
 	int max_iters = 0;
 	cluster_convergences.reserve(256);
 	for (int r = 0; r < rows; r++) {
+		//printf("now starting r = %d\n", r);
 		for (int c = 0; c < cols; c++) {
 			const unsigned char* const base_of_pixel = &image_data[(r * cols + c) * 3];
 			Point centroid(base_of_pixel[0], base_of_pixel[1], base_of_pixel[2], r, c);
@@ -127,10 +132,108 @@ unsigned char * cpu_version(const unsigned char* image_data, int rows, int cols,
 			result[(r * cols + c) * 3] = cluster_id;
 		}
 	}
+	kd_free(kd);
 	fprintf(stderr, "Max iters in CPU version was %d\n", max_iters);
 	
 	//now compute average rgb for each cluster
-	color_result(image_data, result, cluster_convergences.size(), rows, cols);
+	if (do_color) {
+		color_result(image_data, result, cluster_convergences.size(), rows, cols);
+	}
+	return result;
+}
+
+unsigned char *cpu_version_with_trajectories(const unsigned char *image_data, int rows, int cols, float radius, float convergence_threshold, bool do_color) {
+	unsigned char* result = (unsigned char*)malloc(rows * cols * 3);
+    struct kdtree* source_points = kd_create(5);
+    for (int r = 0; r < rows; r++) {
+        for (int c = 0; c < cols; c++) {
+            const unsigned char* const base_of_pixel = &image_data[(r * cols + c) * 3];
+            add_point(source_points, Point(base_of_pixel[0], base_of_pixel[1], base_of_pixel[2], r, c));
+        }
+    }
+	/*
+	make a new kd tree that maps intermediate centroids to what centroid they eventually converge to
+	when iterating a point, keep track of the path of the centroid in a vector
+	after it has converged to centroid `k`, add all these intermediate centroids to the kd tree and have them map to (void*)`k`
+	When iterating future points, if an intermediate centroid is within a certain radius of a point already in the kd tree,
+	it already maps to that centroid.
+	*/
+	struct kdtree *endpoints = kd_create(5);
+	std::vector<Point> cluster_convergences;
+	cluster_convergences.reserve(256);
+	for (int r = 0; r < rows; r++) {
+		for (int c = 0; c < cols; c++) {
+			const unsigned char* const base_of_pixel = &image_data[(r * cols + c) * 3];
+			Point centroid(base_of_pixel[0], base_of_pixel[1], base_of_pixel[2], r, c);
+			std::vector<Point> this_trajectory;
+			int cluster_id = -1;
+			while (true) {
+				struct kdres *traj_points = kd_nearestf(endpoints, &centroid.r);
+				//traj_points can be null if endpoints is empty
+				if (traj_points && kd_res_size(traj_points) != 0) {
+					Point traj_point;
+					int possible_cluster_id = (int)kd_res_itemf(traj_points, &traj_point.r);
+					//Might be worth trying different thresholds here
+					//If centroid was close enough to an already seen traj point, it will not be added to endpoints using this method.
+					if (traj_point.distance_squared(&centroid) <= convergence_threshold * convergence_threshold) {
+						centroid = cluster_convergences[possible_cluster_id];
+						kd_res_free(traj_points);
+						cluster_id = possible_cluster_id;
+						break;
+					}
+				}
+				
+				Point new_centroid(0,0,0,0,0);
+				struct kdres* near_points = neighbors(source_points, centroid, radius);
+				Point temp;
+				KD_FOR(temp, near_points) {
+					for (int i = 0; i < 5; i++) {
+						*new_centroid[i] += *temp[i];
+					}
+				}
+				int num_near_points = kd_res_size(near_points);
+				kd_res_free(near_points);
+				for (int i = 0; i < 5; i++) {
+					*new_centroid[i] /= num_near_points;
+				}
+				this_trajectory.push_back(new_centroid);
+				float delta_squared = new_centroid.distance_squared(&centroid);
+				centroid = new_centroid;
+				if (delta_squared <= convergence_threshold * convergence_threshold) {
+					break;
+				}
+			}
+			if (cluster_id == -1) {
+				//did not join with existing trajectory
+				for (int i = 0; i < cluster_convergences.size(); i++) {
+					//two paths to the same center could have converged from opposite directions,
+					//so using 2 * convergence_threshold here.
+					if (cluster_convergences[i].distance_squared(&centroid) <= 4 * convergence_threshold * convergence_threshold) {
+						//this point converges to a centroid that has already been seen before
+						cluster_id = i;
+						break;
+					}
+				}
+				if (cluster_id == -1) {
+					if (cluster_convergences.size() == 256) {
+						fprintf(stderr, "ERROR: more than 256 clusters identified, try tweaking CONVERGENCE_THRESHOLD and SEARCH_RADIUS\n");
+						assert(0);
+					}
+					cluster_convergences.push_back(centroid);
+					cluster_id = cluster_convergences.size() - 1;
+				}
+			}
+			result[(r * cols + c) * 3] = cluster_id;
+			
+			for (int i = 0; i < this_trajectory.size(); i++) {
+				assert( kd_insertf(endpoints, &this_trajectory[i].r, (void*)cluster_id) == 0 );
+			}
+		}
+	}
+	kd_free(endpoints);
+	kd_free(source_points);
+	
+	if (do_color) color_result(image_data, result, cluster_convergences.size(), rows, cols);
 	return result;
 }
 
@@ -179,12 +282,12 @@ __host__ __device__ void naive_kernel_internals(const unsigned char* image, int 
 	int num_neighbors = 0;
 	Point* this_centroid = &centroids[r * cols + c];
 	const float radius_squared = radius * radius;
-	for (int d_r = floorf(-radius) - 1; d_r <= ceilf(radius) + 1; d_r++) {
+	for (int d_r = (int)floorf(-radius) - 1; d_r <= (int)ceilf(radius) + 1; d_r++) {
 		//float limit = sqrtf(radius * radius - d_r * d_r);
 		//for (int d_c = floorf(-limit); d_c <= ceilf(limit); d_c++) {
-		for (int d_c = floorf(-radius) - 1; d_c <= ceilf(radius) + 1; d_c++) {
+		for (int d_c = (int)floorf(-radius) - 1; d_c <= (int)ceilf(radius) + 1; d_c++) {
 			if (d_r * d_r + d_c * d_c > radius_squared) continue;
-			int search_r = floorf(this_centroid->row + d_r), search_c = floorf(this_centroid->col + d_c);
+			int search_r = (int)floorf(this_centroid->row + d_r), search_c = (int)floorf(this_centroid->col + d_c);
 			if (search_r < 0 || search_r >= rows || search_c < 0 || search_c >= cols) {
 				continue;
 			}
@@ -256,7 +359,7 @@ __global__ void naive_kernel(const unsigned char *image, int rows, int cols, flo
 	deltas[r * cols + c] = distance_squared;
 }
 
-unsigned char* sequential_gpu_version(const unsigned char* image_data, int rows, int cols, float radius, float convergence_threshold) {
+unsigned char* sequential_gpu_version(const unsigned char* image_data, int rows, int cols, float radius, float convergence_threshold, bool do_color) {
 	unsigned char *result = (unsigned char*)malloc(rows * cols * 3);
 	Point *centroids = (Point*)malloc(rows * cols * sizeof(Point));
 	for (int r = 0; r < rows; r++){
@@ -311,12 +414,12 @@ unsigned char* sequential_gpu_version(const unsigned char* image_data, int rows,
 					assert(0);
 				}
 				cluster_convergences.push_back(centroids[r * cols + c]);
-				cluster_id = cluster_convergences.size() - 1;
+				cluster_id = (int)cluster_convergences.size() - 1;
 			}
 			result[(r * cols + c) * 3] = cluster_id;
 		}
 	}
-	color_result(image_data, result, cluster_convergences.size(), rows, cols);
+	if (do_color) color_result(image_data, result, cluster_convergences.size(), rows, cols);
 	
 	free(deltas);
 	free(centroids);
@@ -356,7 +459,7 @@ __global__ void max_in_groups(float* data, int n) {
 	}
 }
 
-unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int cols, float radius, float convergence_threshold) {
+unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int cols, float radius, float convergence_threshold, bool do_color) {
 	unsigned char *result = (unsigned char*)malloc(rows * cols * 3);
 	cudaError_t err_code = cudaSuccess;
 	err_code = cudaSetDevice(0);
@@ -387,7 +490,7 @@ unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int
 
 	int iters = 0;
 	while (true) {
-		fprintf(stderr, "now starting iter %d\n", iters++);
+		//fprintf(stderr, "now starting iter %d\n", iters++);
 		//My device (NVIDIA GeForce GTX 1660) has a max of 1024 threads per block
 		dim3 block_dims(32, 32);
 		dim3 grid_dims((int)ceil(cols / (float) 32), (int)ceil(rows / (float)32));
@@ -455,7 +558,7 @@ unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int
 			result[(r * cols + c) * 3] = cluster_id;
 		}
 	}
-	color_result(image_data, result, cluster_convergences.size(), rows, cols);
+	if (do_color) color_result(image_data, result, cluster_convergences.size(), rows, cols);
 	
 	free(host_centroids);
 	cudaFree(dev_centroids);
@@ -467,23 +570,61 @@ unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int
 }
 #define SEARCH_RADIUS 50
 #define CONVERGENCE_THRESHOLD 10
+
+void timings(const char* filename) {
+	std::cout << "Now timing on " << filename << std::endl;
+	int rows, cols, channels;
+	unsigned char* image_data = (unsigned char*)stbi_load(filename, &cols, &rows, &channels, 3);
+	if (!image_data) {
+		fprintf(stderr, "Error reading image: %s\n", stbi_failure_reason());
+		return;
+	}
+
+	auto start = std::chrono::high_resolution_clock::now();
+	cpu_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, false);
+	auto end = std::chrono::high_resolution_clock::now();
+	printf("naive CPU: %10lldms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+
+	start = std::chrono::high_resolution_clock::now();
+	cpu_version_with_trajectories(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, false);
+	end = std::chrono::high_resolution_clock::now();
+	printf("CPU w/trj: %10lldms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+
+	start = std::chrono::high_resolution_clock::now();
+	sequential_gpu_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, false);
+	end = std::chrono::high_resolution_clock::now();
+	printf("seq GPU  : %10lldms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+
+	start = std::chrono::high_resolution_clock::now();
+	naive_GPU_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, false);
+	end = std::chrono::high_resolution_clock::now();
+	printf("naive GPU: %10lldms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+}
 int main()
 {
+
+	//timings("test_images/dapper_lad_smaller.jpg");
+	//timings("test_images/dapper_lad.jpg");
+
     int rows, cols, channels;
     unsigned char* image_data = (unsigned char*)stbi_load("test_images/dapper_lad_smaller.jpg", &cols, &rows, &channels, 3);
     if (!image_data) {
-        fprintf(stderr, "Error reading image: %s", stbi_failure_reason());
+        fprintf(stderr, "Error reading image: %s\n", stbi_failure_reason());
         return -1;
     }
-    unsigned char * cpu_result = cpu_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD);
+    unsigned char * cpu_result = cpu_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, true);
     stbi_write_png("cpu_output.png", cols, rows, 3, cpu_result, 0);
     free(cpu_result);
 
-	/*unsigned char* sequential_kernel_result = sequential_gpu_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD);
-	stbi_write_png("sequential_output.png", cols, rows, 3, sequential_kernel_result, 0);
-	free(sequential_kernel_result);*/
+	unsigned char* cpu_traj_result = cpu_version_with_trajectories(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, true);
+	stbi_write_png("cpu_output_traj.png", cols, rows, 3, cpu_traj_result, 0);
+	free(cpu_traj_result);
 
-	unsigned char * gpu_result = naive_GPU_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD);
+	unsigned char* sequential_kernel_result = sequential_gpu_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, true);
+	stbi_write_png("sequential_output.png", cols, rows, 3, sequential_kernel_result, 0);
+	free(sequential_kernel_result);
+
+	unsigned char * gpu_result = naive_GPU_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, true);
 	stbi_write_png("gpu_output.png", cols, rows, 3, gpu_result, 0);
 	free(gpu_result);
 	
@@ -493,7 +634,7 @@ int main()
     // tracing tools such as Nsight and Visual Profiler to show complete traces.
     cudaError_t cudaStatus = cudaDeviceReset();
     if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaDeviceReset failed!");
+        fprintf(stderr, "cudaDeviceReset failed!\n");
         return 1;
     }
 

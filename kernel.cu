@@ -319,6 +319,43 @@ __global__ void naive_kernel(const unsigned char *image, int rows, int cols, flo
 	if (r >= rows || c >= cols) {
 		return;
 	}
+
+	/*
+	* Each block is 32x32
+	* My initial guess for SEARCH_RADIUS is 50
+	* can fit a max of 16384 pixels in shmem
+	* Doesn't make sense for shared memory to be more than [132][132]
+	* Maximum shared memory on my device is [128][128]
+	* More shared mem means less L1, try varying shared mem dimensions
+	* Should be at least 32x32?
+	*/
+//number of pixels beyond the 32x32 that should be in shared memory
+#define SH_PAD 48
+//total dimension length of shared memory
+#define SH_DIM (32 + 2*SH_PAD)
+//Each thread is responsible for loading this many (squared) pixels
+#define RESP_DIM ((SH_DIM + 31) / 32)
+#if 0
+	__shared__ unsigned char shared[SH_DIM][SH_DIM][3];
+	for (int r_offset = 0; r_offset < RESP_DIM; r_offset++) {
+		for (int c_offset = 0; c_offset < RESP_DIM; c_offset++) {
+			const int image_r = 32 * blockIdx.y - SH_PAD + threadIdx.y * RESP_DIM,
+				image_c = 32 * blockIdx.x - SH_PAD + threadIdx.x * RESP_DIM;
+			if (image_r < 0 || image_r >= rows || image_c < 0 || image_c >= cols) {
+				continue;
+			}
+			const unsigned char* const base_of_pixel = &image[(image_r * cols + image_c) * 3];
+			int dest_r = RESP_DIM * threadIdx.y + r_offset,
+				dest_c = RESP_DIM * threadIdx.x + c_offset;
+			if (dest_r >= 0 && dest_r < SH_DIM && dest_c >= 0 && dest_c < SH_DIM) {
+				shared[RESP_DIM * threadIdx.y + r_offset][RESP_DIM + threadIdx.x + c_offset][0] = base_of_pixel[0];
+				shared[RESP_DIM * threadIdx.y + r_offset][RESP_DIM + threadIdx.x + c_offset][1] = base_of_pixel[1];
+				shared[RESP_DIM * threadIdx.y + r_offset][RESP_DIM + threadIdx.x + c_offset][2] = base_of_pixel[2];
+			}
+		}
+	}
+	__syncthreads();
+#endif
 	if (deltas[r * cols + c] <= convergence_threshold) {
 		return;
 	}
@@ -451,7 +488,7 @@ __global__ void max_in_groups(float* data, int n) {
 	for (unsigned short stride = 1024; stride >= 1; stride >>= 1) {
 		__syncthreads();
 		if (t_id < stride) {
-			block_data[t_id] += max(block_data[t_id + stride], block_data[t_id]);
+			block_data[t_id] = max(block_data[t_id + stride], block_data[t_id]);
 		}
 	}
 
@@ -523,19 +560,25 @@ unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int
 			}
 		}*/
 
-		//Faster code to find max delta
+		//Faster code to check for convergence
 		//change this to do diagnostics on whole-warp convergence
 #if 1
 		int blocks_necessary = (int)ceil((float)(rows * cols) / 2048.0f); //1024 is max threads per block on my device
-		max_in_groups<<<blocks_necessary, 2048>>>(dev_deltas, rows * cols);
-		float max_delta = 0.0f;
+		max_in_groups<<<blocks_necessary, 1024>>>(dev_deltas, rows * cols);
+		err_code = cudaGetLastError();
+		err_code = cudaDeviceSynchronize();
+		bool all_below_threshold = true;
 		//Maybe it would be faster to make one big array here and just do one memcpy into that
-		for (int i = 0; i < rows * cols; i++) {
+		for (int i = 0; i < rows * cols; i += 2048) {
 			float temp;
 			cudaMemcpy(&temp, &dev_deltas[i], sizeof(float), cudaMemcpyDeviceToHost);
-			if (temp > max_delta) {
-				max_delta = temp;
+			if (temp > convergence_threshold) {
+				all_below_threshold = false;
+				break;
 			}
+		}
+		if (all_below_threshold) {
+			break;
 		}
 		
 #else
@@ -575,12 +618,11 @@ unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int
 		}
 		fprintf(stderr, "Iteration %d has %d deltas > %f, %d / %d warps converged (%f%%)\n", iters++, amount_above_thresh, convergence_threshold,
 			warps_converged, total_warps, (float)warps_converged / (float)total_warps);
-#endif
-
 		if (max_delta < convergence_threshold) {
 			break;
 		}
-		
+#endif
+		iters++;
 	}
 	
 	err_code = cudaMemcpy(host_centroids, dev_centroids, rows * cols * sizeof(float), cudaMemcpyDeviceToHost);
@@ -651,9 +693,9 @@ void timings(const char* filename) {
 }
 int main()
 {
-
 	//timings("test_images/dapper_lad_smaller.jpg");
-	//timings("test_images/dapper_lad.jpg");
+	timings("test_images/dapper_lad.jpg");
+	return;
 
     int rows, cols, channels;
     unsigned char* image_data = (unsigned char*)stbi_load("test_images/dapper_lad_smaller.jpg", &cols, &rows, &channels, 3);

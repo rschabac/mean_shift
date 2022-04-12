@@ -1,0 +1,107 @@
+Name 0
+Async Engine Count 6
+CUdevice 0x0
+Can Flush Remote Writes false
+Can Map Host Memory true
+Can Tex2d Gather true
+Can Use 64bit Stream Memory Operations false
+Can Use Host Pointer_For Registered Memory false
+Can Use Stream Memory Operations false
+Can Use Stream Wait Value NOR false
+Clock Rate 1830000
+Compute Mode 0
+Compute Preemption Supported true
+Concurrent Kernels true
+Concurrent Managed Access false
+Cooperative Launch true
+Cooperative Multi-Device Launch false
+Device ID 0
+Device Name NVIDIA GeForce GTX 1660
+Direct Managed Mem Access From Host false
+Ecc Enabled false
+GPU Direct RDMA Flush Writes Options 0
+GPU Direct RDMA Supported false
+GPU Direct RDMA With Cuda VMM Supported false
+GPU Direct RDMA Writes Ordering 0
+GPU Overlap true
+Generic Compression Supported false
+Global L1 Cache Supported true
+Global Memory Bus Width 192
+Handle Type Posix File Descriptor Supported false
+Handle Type Win32 Handle Supported true
+Handle Type Win32 KMD Handle Supported true
+Host Native Atomic Supported false
+Host Register Supported true
+ID 1
+Integrated false
+Kernel Exec Timeout true
+L2 Cache Size 1572864
+Local L1 Cache Supported true
+Managed Memory true
+Max Access Policy Window Size 0
+Max Block Dim X 1024
+Max Block Dim Y 1024
+Max Block Dim Z 64
+Max Blocks Per Multiprocessor 16
+Max Grid Dim X 2147483647
+Max Grid Dim Y 65535
+Max Grid Dim Z 65535
+Max Persisting L2 Cache Size 0
+Max Pitch 2147483647
+Max Registers Per Block 65536
+Max Registers Per Multiprocessor 65536
+Max Shared Memory Per Block 49152
+Max Shared Memory Per Block Optin 65536
+Max Shared Memory Per Multiprocessor 65536
+Max Threads Per Block 1024
+Max Threads Per Multiprocessor 1024
+Maximum Surface1d Layered Layers 2048
+Maximum Surface1d Layered Width 32768
+Maximum Surface1d Width 32768
+Maximum Surface2d Height 65536
+Maximum Surface2d Layered Height 32768
+Maximum Surface2d Layered Layers 2048
+Maximum Surface2d Layered Width 32768
+Maximum Surface2d Width 131072
+Maximum Surface3d Depth 16384
+Maximum Surface3d Height 16384
+Maximum Surface3d Width 16384
+Maximum Surfacecubemap Layered Layers 2046
+Maximum Surfacecubemap Layered Width 32768
+Maximum Surfacecubemap Width 32768
+Maximum Texture1d Layered Layers 2048
+Maximum Texture1d Layered Width 32768
+Maximum Texture1d Linear Width 268435456
+Maximum Texture1d Mipmapped Width 32768
+Maximum Texture1d Width 131072
+Maximum Texture2d Gather Height 32768
+Maximum Texture2d Gather Width 32768
+Maximum Texture2d Height 65536
+Maximum Texture2d Layered Height 32768
+Maximum Texture2d Layered Layers 2048
+Maximum Texture2d Layered Width 32768
+Maximum Texture2d Linear Height 65000
+Maximum Texture2d Linear Pitch 2097120
+Maximum Texture2d Linear Width 131072
+Maximum Texture2d Mipmapped Height 32768
+Maximum Texture2d Mipmapped Width 32768
+Maximum Texture2d Width 131072
+Maximum Texture3d Depth 16384
+Maximum Texture3d Depth Alternate 32768
+Maximum Texture3d Height 16384
+Maximum Texture3d Height Alternate 8192
+Maximum Texture3d Width 16384
+Maximum Texture3d Width Alternate 8192
+Maximum Texturecubemap Layered Layers 2046
+Maximum Texturecubemap Layered Width 32768
+Maximum Texturecubemap Width 32768
+Memory Clock Rate 4001000
+Memory Pool Supported true
+Mempool Supported Handle Types 0
+Multi GPU Board false
+Multi GPU Board Group ID 0
+Multiprocessor Count 22
+Pageable Memory Access false
+Pageable Memory Access Uses Host Page Tables false
+Pci Bus ID 1
+Pci Device ID 0

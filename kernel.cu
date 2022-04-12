@@ -133,7 +133,7 @@ unsigned char * cpu_version(const unsigned char* image_data, int rows, int cols,
 		}
 	}
 	kd_free(kd);
-	fprintf(stderr, "Max iters in CPU version was %d\n", max_iters);
+	//fprintf(stderr, "Max iters in CPU version was %d\n", max_iters);
 	
 	//now compute average rgb for each cluster
 	if (do_color) {
@@ -270,14 +270,14 @@ void color_result(const unsigned char *image_data, unsigned char *result, int nu
 
 
 
-__host__ __device__ void naive_kernel_internals(const unsigned char* image, int rows, int cols, int r, int c, float radius, Point* centroids, float* deltas) {
+void naive_kernel_internals(const unsigned char* image, int rows, int cols, int r, int c, float radius, Point* centroids, float* deltas, float convergence_threshold) {
 	if (r >= rows || c >= cols) {
 		return;
 	}
-	//if (deltas[r * cols + c] < 0.1f) {
-	//	//HOST ONLY
-	//	return;
-	//}
+	if (deltas[r * cols + c] <= convergence_threshold) {
+		//No need to keep iterating this centroid
+		return;
+	}
 	Point new_centroid(0, 0, 0, 0, 0);
 	int num_neighbors = 0;
 	Point* this_centroid = &centroids[r * cols + c];
@@ -314,15 +314,14 @@ __host__ __device__ void naive_kernel_internals(const unsigned char* image, int 
 	deltas[r * cols + c] = distance_squared;
 }
 
-__global__ void naive_kernel(const unsigned char *image, int rows, int cols, float radius, Point *centroids, float *deltas) {
+__global__ void naive_kernel(const unsigned char *image, int rows, int cols, float radius, Point *centroids, float *deltas, float convergence_threshold) {
 	int c = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y * blockDim.y + threadIdx.y;
 	if (r >= rows || c >= cols) {
 		return;
 	}
-	//if (deltas[r * cols + c] < 0.1f) {
-	//	//HOST ONLY
-	//	return;
-	//}
+	if (deltas[r * cols + c] <= convergence_threshold) {
+		return;
+	}
 	Point new_centroid(0, 0, 0, 0, 0);
 	int num_neighbors = 0;
 	Point* this_centroid = &centroids[r * cols + c];
@@ -378,21 +377,24 @@ unsigned char* sequential_gpu_version(const unsigned char* image_data, int rows,
 	
 	int iters = 0;
 	while (true) {
-		fprintf(stderr, "starting iter %d\n", iters++);
 		for (int r = 0; r < rows; r++) {
 			for (int c = 0; c < cols; c++) {
-				naive_kernel_internals(image_data, rows, cols, r, c, radius, centroids, deltas);
+				naive_kernel_internals(image_data, rows, cols, r, c, radius, centroids, deltas, convergence_threshold);
 			}
 		}
-		float max_delta = 0.0f;
+		bool found_greater_than_thresh = false;
 		for (int r = 0; r < rows; r++) {
 			for (int c = 0; c < cols; c++) {
-				if (deltas[r * cols + c] > max_delta) {
-					max_delta = deltas[r * cols + c];
+				if (deltas[r * cols + c] > convergence_threshold) {
+					found_greater_than_thresh = true;
+					break;
 				}
 			}
+			if (found_greater_than_thresh) {
+				break;
+			}
 		}
-		if (max_delta <= convergence_threshold) {
+		if (!found_greater_than_thresh) {
 			break;
 		}
 	}
@@ -475,8 +477,12 @@ unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int
 	err_code = cudaMemcpy(dev_centroids, host_centroids, rows * cols * sizeof(Point), cudaMemcpyHostToDevice);
 	
 	float *host_deltas = (float*)malloc(rows * cols * sizeof(float));
+	for (int i = 0; i < rows * cols; i++) {
+		host_deltas[i] = INFINITY;
+	}
 	float *dev_deltas = NULL;
 	err_code = cudaMalloc((void**)&dev_deltas, rows * cols * sizeof(float));
+	err_code = cudaMemcpy(dev_deltas, host_deltas, rows * cols * sizeof(float), cudaMemcpyHostToDevice);
 	
 	unsigned char *dev_image = NULL;
 	err_code = cudaMalloc((void**)&dev_image, rows * cols * 3);
@@ -494,7 +500,7 @@ unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int
 		//My device (NVIDIA GeForce GTX 1660) has a max of 1024 threads per block
 		dim3 block_dims(32, 32);
 		dim3 grid_dims((int)ceil(cols / (float) 32), (int)ceil(rows / (float)32));
-		naive_kernel<<<grid_dims, block_dims>>>(dev_image, rows, cols, radius, dev_centroids, dev_deltas);
+		naive_kernel<<<grid_dims, block_dims>>>(dev_image, rows, cols, radius, dev_centroids, dev_deltas, convergence_threshold);
 		
 		err_code = cudaGetLastError(); //errors from launching the kernel
 		err_code = cudaDeviceSynchronize(); //errors that happened during the kernel launch
@@ -516,7 +522,11 @@ unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int
 				}
 			}
 		}*/
-		int blocks_necessary = (int)ceil((float)(rows * cols) / 2048.0f); //1024 is max threads per block
+
+		//Faster code to find max delta
+		//change this to do diagnostics on whole-warp convergence
+#if 1
+		int blocks_necessary = (int)ceil((float)(rows * cols) / 2048.0f); //1024 is max threads per block on my device
 		max_in_groups<<<blocks_necessary, 2048>>>(dev_deltas, rows * cols);
 		float max_delta = 0.0f;
 		//Maybe it would be faster to make one big array here and just do one memcpy into that
@@ -527,6 +537,45 @@ unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int
 				max_delta = temp;
 			}
 		}
+		
+#else
+		float max_delta = 0.0f;
+		int amount_above_thresh = 0;
+		err_code = cudaMemcpy(host_deltas, dev_deltas, rows * cols * sizeof(float), cudaMemcpyDeviceToHost);
+		for (int r = 0; r < rows; r++) {
+			for (int c = 0; c < cols; c++) {
+				if (host_deltas[r * cols + c] > convergence_threshold) {
+					amount_above_thresh++;
+				}
+				if (host_deltas[r * cols + c] > max_delta) {
+					max_delta = host_deltas[r * cols + c];
+				}
+			}
+		}
+		/*
+		* If I make the blocks 32x32, each warp handles a row of threads
+		* This checks if every thread in a warp would have converged
+		*/
+		int warps_converged = 0;
+		int total_warps = 0;
+		for (int r = 0; r < rows; r++) {
+			for (int warp = 0; warp < (cols + 31) / 32; warp++) {
+				total_warps++;
+				bool warp_entirely_converged = true;
+				for (int c = warp * 32; c < warp * 32 + 32 && c < cols; c++) {
+					if (host_deltas[r * cols + c] > convergence_threshold) {
+						warp_entirely_converged = false;
+						break;
+					}
+				}
+				if (warp_entirely_converged) {
+					warps_converged++;
+				}
+			}
+		}
+		fprintf(stderr, "Iteration %d has %d deltas > %f, %d / %d warps converged (%f%%)\n", iters++, amount_above_thresh, convergence_threshold,
+			warps_converged, total_warps, (float)warps_converged / (float)total_warps);
+#endif
 
 		if (max_delta < convergence_threshold) {
 			break;

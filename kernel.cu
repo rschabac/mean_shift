@@ -539,12 +539,9 @@ unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int
 		dim3 grid_dims((int)ceil(cols / (float) 32), (int)ceil(rows / (float)32));
 		naive_kernel<<<grid_dims, block_dims>>>(dev_image, rows, cols, radius, dev_centroids, dev_deltas, convergence_threshold);
 		
-		err_code = cudaGetLastError(); //errors from launching the kernel
-		err_code = cudaDeviceSynchronize(); //errors that happened during the kernel launch
+		//err_code = cudaGetLastError(); //errors from launching the kernel
+		//err_code = cudaDeviceSynchronize(); //errors that happened during the kernel launch
 		
-		//err_code = cudaMemcpy(host_deltas, dev_deltas, rows * cols * sizeof(float), cudaMemcpyDeviceToHost);
-		//load-bearing memcpy, do not remove
-		err_code = cudaMemcpy(host_centroids, dev_centroids, rows * cols * sizeof(Point), cudaMemcpyDeviceToHost);
 		/*{ //just for comparing against sequential "kernel"
 			cudaMemcpy(host_centroids, dev_centroids, rows * cols * sizeof(Point), cudaMemcpyDeviceToHost);
 			for (int r = 0; r < rows; r++) {
@@ -625,7 +622,7 @@ unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int
 		iters++;
 	}
 	
-	err_code = cudaMemcpy(host_centroids, dev_centroids, rows * cols * sizeof(float), cudaMemcpyDeviceToHost);
+	err_code = cudaMemcpy(host_centroids, dev_centroids, rows * cols * sizeof(Point), cudaMemcpyDeviceToHost);
 	
 	std::vector<Point> cluster_convergences;
 	cluster_convergences.reserve(256);
@@ -671,24 +668,24 @@ void timings(const char* filename) {
 		return;
 	}
 
-	auto start = std::chrono::high_resolution_clock::now();
+	/*auto start = std::chrono::high_resolution_clock::now();
 	cpu_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, false);
 	auto end = std::chrono::high_resolution_clock::now();
-	printf("naive CPU: %10lldms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+	printf("naive CPU: %10lldms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());*/
 
-	start = std::chrono::high_resolution_clock::now();
+	/*start = std::chrono::high_resolution_clock::now();
 	cpu_version_with_trajectories(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, false);
 	end = std::chrono::high_resolution_clock::now();
-	printf("CPU w/trj: %10lldms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+	printf("CPU w/trj: %10lldms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());*/
 
-	start = std::chrono::high_resolution_clock::now();
-	sequential_gpu_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, false);
-	end = std::chrono::high_resolution_clock::now();
-	printf("seq GPU  : %10lldms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+	//start = std::chrono::high_resolution_clock::now();
+	//sequential_gpu_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, false);
+	//end = std::chrono::high_resolution_clock::now();
+	//printf("seq GPU  : %10lldms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
 
-	start = std::chrono::high_resolution_clock::now();
+	auto start = std::chrono::high_resolution_clock::now();
 	naive_GPU_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, false);
-	end = std::chrono::high_resolution_clock::now();
+	auto end = std::chrono::high_resolution_clock::now();
 	printf("naive GPU: %10lldms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
 }
 int main()
@@ -703,13 +700,13 @@ int main()
         fprintf(stderr, "Error reading image: %s\n", stbi_failure_reason());
         return -1;
     }
-    unsigned char * cpu_result = cpu_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, true);
+    /*unsigned char * cpu_result = cpu_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, true);
     stbi_write_png("cpu_output.png", cols, rows, 3, cpu_result, 0);
-    free(cpu_result);
+    free(cpu_result);*/
 
-	unsigned char* cpu_traj_result = cpu_version_with_trajectories(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, true);
+	/*unsigned char* cpu_traj_result = cpu_version_with_trajectories(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, true);
 	stbi_write_png("cpu_output_traj.png", cols, rows, 3, cpu_traj_result, 0);
-	free(cpu_traj_result);
+	free(cpu_traj_result);*/
 
 	unsigned char* sequential_kernel_result = sequential_gpu_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, true);
 	stbi_write_png("sequential_output.png", cols, rows, 3, sequential_kernel_result, 0);

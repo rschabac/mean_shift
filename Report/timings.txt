@@ -1,0 +1,6 @@
+dapper_lad.jpg:
+naive CPU (kd trees):  45318 ms
+kd trees, with traj :  44386 ms
+naive GPU, bad reduc: 148198 ms
+naive GPU, good redc:   1138 ms
+", with early stop  :    357 ms

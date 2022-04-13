@@ -46,6 +46,15 @@ struct Point {
     Point() = default;
 };
 
+//CONFIG
+
+#define SEARCH_RADIUS 50
+#define CONVERGENCE_THRESHOLD 10
+#define USE_SHMEM
+//#define COMPARE_GPU_AGAINST_SEQ
+#define EARLY_STOP
+#define USE_REDUCTION_KERNEL
+
 void add_point(struct kdtree* kd, Point p) {
 	//simplest way to handle errors
 	auto result = kd_insertf(kd, &p.r, NULL);
@@ -59,9 +68,10 @@ struct kdres* neighbors(struct kdtree* kd, Point p, float radius) {
 //Still have to call neighbors before, and kd_res_free after this
 #define KD_FOR(point, set) for (kd_res_itemf(set, &point.r); !kd_res_end(set); kd_res_next(set), kd_res_itemf(set, &point.r))
 
-void color_result(const unsigned char *, unsigned char *, int, int, int);
+void color_result(const unsigned char *, unsigned char *, int *, int, int, int);
 unsigned char * cpu_version(const unsigned char* image_data, int rows, int cols, float radius, float convergence_threshold, bool do_color) {
     unsigned char* result = (unsigned char*)malloc(rows * cols * 3);
+	int* cluster_ids = (int*)malloc(rows * cols * sizeof(int));
     struct kdtree* kd = kd_create(5);
     for (int r = 0; r < rows; r++) {
         for (int c = 0; c < cols; c++) {
@@ -73,8 +83,6 @@ unsigned char * cpu_version(const unsigned char* image_data, int rows, int cols,
 	/*
 	for each point, see what it converges to
 	if its convergence point is not in the map/vector, it is a new cluster
-	set its r value in result to the cluster number
-	Using this scheme, max clusters is 256
 	
 	once all are clustered, find average rgb over each cluster, then update colors appropriately
 	*/
@@ -122,14 +130,10 @@ unsigned char * cpu_version(const unsigned char* image_data, int rows, int cols,
 				}
 			}
 			if (cluster_id == -1) {
-				if (cluster_convergences.size() == 256) {
-					fprintf(stderr, "ERROR: more than 256 clusters identified, try tweaking CONVERGENCE_THRESHOLD and SEARCH_RADIUS\n");
-					assert(0);
-				}
 				cluster_convergences.push_back(centroid);
 				cluster_id = cluster_convergences.size() - 1;
 			}
-			result[(r * cols + c) * 3] = cluster_id;
+			cluster_ids[r * cols + c] = cluster_id;
 		}
 	}
 	kd_free(kd);
@@ -137,13 +141,15 @@ unsigned char * cpu_version(const unsigned char* image_data, int rows, int cols,
 	
 	//now compute average rgb for each cluster
 	if (do_color) {
-		color_result(image_data, result, cluster_convergences.size(), rows, cols);
+		color_result(image_data, result, cluster_ids, cluster_convergences.size(), rows, cols);
 	}
+	free(cluster_ids);
 	return result;
 }
 
 unsigned char *cpu_version_with_trajectories(const unsigned char *image_data, int rows, int cols, float radius, float convergence_threshold, bool do_color) {
 	unsigned char* result = (unsigned char*)malloc(rows * cols * 3);
+	int* cluster_ids = (int*)malloc(rows * cols * sizeof(int));
     struct kdtree* source_points = kd_create(5);
     for (int r = 0; r < rows; r++) {
         for (int c = 0; c < cols; c++) {
@@ -215,15 +221,11 @@ unsigned char *cpu_version_with_trajectories(const unsigned char *image_data, in
 					}
 				}
 				if (cluster_id == -1) {
-					if (cluster_convergences.size() == 256) {
-						fprintf(stderr, "ERROR: more than 256 clusters identified, try tweaking CONVERGENCE_THRESHOLD and SEARCH_RADIUS\n");
-						assert(0);
-					}
 					cluster_convergences.push_back(centroid);
 					cluster_id = cluster_convergences.size() - 1;
 				}
 			}
-			result[(r * cols + c) * 3] = cluster_id;
+			cluster_ids[r * cols + c] = cluster_id;
 			
 			for (int i = 0; i < this_trajectory.size(); i++) {
 				assert( kd_insertf(endpoints, &this_trajectory[i].r, (void*)cluster_id) == 0 );
@@ -233,18 +235,20 @@ unsigned char *cpu_version_with_trajectories(const unsigned char *image_data, in
 	kd_free(endpoints);
 	kd_free(source_points);
 	
-	if (do_color) color_result(image_data, result, cluster_convergences.size(), rows, cols);
+	if (do_color) color_result(image_data, result, cluster_ids, cluster_convergences.size(), rows, cols);
+	free(cluster_ids);
 	return result;
 }
 
-void color_result(const unsigned char *image_data, unsigned char *result, int num_clusters, int rows, int cols) {
+void color_result(const unsigned char *image_data, unsigned char *result, int *cluster_ids, int num_clusters, int rows, int cols) {
 	std::vector<long long> average_rs(num_clusters),
 							average_gs(num_clusters),
 							average_bs(num_clusters);
 	std::vector<int> cluster_sizes(num_clusters);
+	//fprintf(stderr, "%d clusters\n", num_clusters);
 	for (int r = 0; r < rows; r++) {
 		for (int c = 0; c < cols; c++) {
-			int cluster_num = result[(r * cols + c) * 3];
+			int cluster_num = cluster_ids[r * cols + c];
 			cluster_sizes[cluster_num]++;
 			const unsigned char * const base_of_pixel = &image_data[(r * cols + c) * 3];
 			average_rs[cluster_num] += base_of_pixel[0];
@@ -260,7 +264,7 @@ void color_result(const unsigned char *image_data, unsigned char *result, int nu
 	for (int r = 0; r < rows; r++) {
 		for (int c = 0; c < cols; c++) {
 			char unsigned * const base_of_result_pixel = &result[(r * cols + c) * 3];
-			int cluster_num = base_of_result_pixel[0];
+			int cluster_num = cluster_ids[r * cols + c];
 			base_of_result_pixel[0] = average_rs[cluster_num];
 			base_of_result_pixel[1] = average_gs[cluster_num];
 			base_of_result_pixel[2] = average_bs[cluster_num];
@@ -268,16 +272,16 @@ void color_result(const unsigned char *image_data, unsigned char *result, int nu
 	}
 }
 
-
-
 void naive_kernel_internals(const unsigned char* image, int rows, int cols, int r, int c, float radius, Point* centroids, float* deltas, float convergence_threshold) {
 	if (r >= rows || c >= cols) {
 		return;
 	}
+#ifdef EARLY_STOP
 	if (deltas[r * cols + c] <= convergence_threshold) {
 		//No need to keep iterating this centroid
 		return;
 	}
+#endif
 	Point new_centroid(0, 0, 0, 0, 0);
 	int num_neighbors = 0;
 	Point* this_centroid = &centroids[r * cols + c];
@@ -316,10 +320,9 @@ void naive_kernel_internals(const unsigned char* image, int rows, int cols, int 
 
 __global__ void naive_kernel(const unsigned char *image, int rows, int cols, float radius, Point *centroids, float *deltas, float convergence_threshold) {
 	int c = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y * blockDim.y + threadIdx.y;
-	if (r >= rows || c >= cols) {
-		return;
-	}
 
+
+#ifdef USE_SHMEM
 	/*
 	* Each block is 32x32
 	* My initial guess for SEARCH_RADIUS is 50
@@ -335,12 +338,11 @@ __global__ void naive_kernel(const unsigned char *image, int rows, int cols, flo
 #define SH_DIM (32 + 2*SH_PAD)
 //Each thread is responsible for loading this many (squared) pixels
 #define RESP_DIM ((SH_DIM + 31) / 32)
-#if 0
 	__shared__ unsigned char shared[SH_DIM][SH_DIM][3];
 	for (int r_offset = 0; r_offset < RESP_DIM; r_offset++) {
 		for (int c_offset = 0; c_offset < RESP_DIM; c_offset++) {
-			const int image_r = 32 * blockIdx.y - SH_PAD + threadIdx.y * RESP_DIM,
-				image_c = 32 * blockIdx.x - SH_PAD + threadIdx.x * RESP_DIM;
+			const int image_r = 32 * blockIdx.y - SH_PAD + threadIdx.y * RESP_DIM + r_offset,
+				image_c = 32 * blockIdx.x - SH_PAD + threadIdx.x * RESP_DIM + c_offset;
 			if (image_r < 0 || image_r >= rows || image_c < 0 || image_c >= cols) {
 				continue;
 			}
@@ -348,32 +350,64 @@ __global__ void naive_kernel(const unsigned char *image, int rows, int cols, flo
 			int dest_r = RESP_DIM * threadIdx.y + r_offset,
 				dest_c = RESP_DIM * threadIdx.x + c_offset;
 			if (dest_r >= 0 && dest_r < SH_DIM && dest_c >= 0 && dest_c < SH_DIM) {
-				shared[RESP_DIM * threadIdx.y + r_offset][RESP_DIM + threadIdx.x + c_offset][0] = base_of_pixel[0];
-				shared[RESP_DIM * threadIdx.y + r_offset][RESP_DIM + threadIdx.x + c_offset][1] = base_of_pixel[1];
-				shared[RESP_DIM * threadIdx.y + r_offset][RESP_DIM + threadIdx.x + c_offset][2] = base_of_pixel[2];
+				shared[dest_r][dest_c][0] = base_of_pixel[0];
+				shared[dest_r][dest_c][1] = base_of_pixel[1];
+				shared[dest_r][dest_c][2] = base_of_pixel[2];
 			}
 		}
 	}
 	__syncthreads();
 #endif
+	//This needs to happen after shmem is populated because out of bounds threads
+	//could still responsible for some in-bounds shmem items
+	if (r >= rows || c >= cols) {
+		return;
+	}
+#ifdef EARLY_STOP
 	if (deltas[r * cols + c] <= convergence_threshold) {
 		return;
 	}
+#endif
 	Point new_centroid(0, 0, 0, 0, 0);
 	int num_neighbors = 0;
 	Point* this_centroid = &centroids[r * cols + c];
 	const float radius_squared = radius * radius;
-	for (int d_r = floorf(-radius) - 1; d_r <= ceilf(radius) + 1; d_r++) {
+	for (int d_r = (int)floorf(-radius) - 1; d_r <= (int)ceilf(radius) + 1; d_r++) {
 		//float limit = sqrtf(radius * radius - d_r * d_r);
 		//for (int d_c = floorf(-limit); d_c <= ceilf(limit); d_c++) {
-		for (int d_c = floorf(-radius) - 1; d_c <= ceilf(radius) + 1; d_c++) {
+		for (int d_c = (int)floorf(-radius) - 1; d_c <= (int)ceilf(radius) + 1; d_c++) {
 			if (d_r * d_r + d_c * d_c > radius_squared) continue;
-			int search_r = floorf(this_centroid->row + d_r), search_c = floorf(this_centroid->col + d_c);
+			int search_r = (int)floorf(this_centroid->row + d_r), search_c = (int)floorf(this_centroid->col + d_c);
 			if (search_r < 0 || search_r >= rows || search_c < 0 || search_c >= cols) {
 				continue;
 			}
+#ifdef USE_SHMEM
+			Point potential_neighbor;
+			/*
+			if blockidx = {2,2}, shared[0][0] is image[64-SH_PAD][64-SH_PAD]
+			shared[SH_PAD][SH_PAD] is image[64][64]
+			shared[SH_DIM-1][SH_DIM-1] is image[96+SH_PAD-1][96+SH_PAD-1]
+			sharedIdx = imgIdx - 32*blkIdx + SH_PAD
+			*/
+			const int shared_r = search_r - 32 * blockIdx.y + SH_PAD,
+				shared_c = search_c - 32 * blockIdx.x + SH_PAD;
+			if (shared_r >= 0 && shared_r < SH_DIM && shared_c >= 0 && shared_c < SH_DIM) {
+				potential_neighbor.r = shared[shared_r][shared_c][0];
+				potential_neighbor.g = shared[shared_r][shared_c][1];
+				potential_neighbor.b = shared[shared_r][shared_c][2];
+			} else {
+				const unsigned char* const base_of_pixel = &image[(search_r * cols + search_c) * 3];
+				potential_neighbor.r = base_of_pixel[0];
+				potential_neighbor.g = base_of_pixel[1];
+				potential_neighbor.b = base_of_pixel[2];
+			}
+			potential_neighbor.row = search_r;
+			potential_neighbor.col = search_c;
+#else
 			const unsigned char* const base_of_pixel = &image[(search_r * cols + search_c) * 3];
 			Point potential_neighbor(base_of_pixel[0], base_of_pixel[1], base_of_pixel[2], search_r, search_c);
+#endif
+			
 			float distance_squared = potential_neighbor.distance_squared(this_centroid);
 			if (distance_squared <= radius_squared) {
 				num_neighbors++;
@@ -397,6 +431,7 @@ __global__ void naive_kernel(const unsigned char *image, int rows, int cols, flo
 
 unsigned char* sequential_gpu_version(const unsigned char* image_data, int rows, int cols, float radius, float convergence_threshold, bool do_color) {
 	unsigned char *result = (unsigned char*)malloc(rows * cols * 3);
+	int* cluster_ids = (int*)malloc(rows * cols * sizeof(int));
 	Point *centroids = (Point*)malloc(rows * cols * sizeof(Point));
 	for (int r = 0; r < rows; r++){
 		for (int c = 0; c < cols; c++) {
@@ -448,18 +483,15 @@ unsigned char* sequential_gpu_version(const unsigned char* image_data, int rows,
 				}
 			}
 			if (cluster_id == -1) {
-				if (cluster_convergences.size() == 256) {
-					fprintf(stderr, "ERROR: more than 256 clusters identified, try tweaking CONVERGENCE_THRESHOLD and SEARCH_RADIUS\n");
-					assert(0);
-				}
 				cluster_convergences.push_back(centroids[r * cols + c]);
 				cluster_id = (int)cluster_convergences.size() - 1;
 			}
-			result[(r * cols + c) * 3] = cluster_id;
+			cluster_ids[r * cols + c] = cluster_id;
 		}
 	}
-	if (do_color) color_result(image_data, result, cluster_convergences.size(), rows, cols);
+	if (do_color) color_result(image_data, result, cluster_ids, cluster_convergences.size(), rows, cols);
 	
+	free(cluster_ids);
 	free(deltas);
 	free(centroids);
 	return result;
@@ -500,6 +532,7 @@ __global__ void max_in_groups(float* data, int n) {
 
 unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int cols, float radius, float convergence_threshold, bool do_color) {
 	unsigned char *result = (unsigned char*)malloc(rows * cols * 3);
+	int* cluster_ids = (int*)malloc(rows * cols * sizeof(int));
 	cudaError_t err_code = cudaSuccess;
 	err_code = cudaSetDevice(0);
 	Point *host_centroids = (Point*)malloc(rows * cols * sizeof(Point));
@@ -525,11 +558,16 @@ unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int
 	err_code = cudaMalloc((void**)&dev_image, rows * cols * 3);
 	err_code = cudaMemcpy(dev_image, image_data, rows * cols * 3, cudaMemcpyHostToDevice);
 	
-	/*Point* seq_centroids = (Point*)malloc(rows * cols * sizeof(Point));
+#ifdef COMPARE_GPU_AGAINST_SEQ
+	Point* seq_centroids = (Point*)malloc(rows * cols * sizeof(Point));
 	float* seq_deltas = (float*)malloc(rows * cols * sizeof(Point));
 	{
+		for (int i = 0; i < rows * cols; i++) {
+			seq_deltas[i] = INFINITY;
+		}
 		memcpy(seq_centroids, host_centroids, rows * cols * sizeof(Point));
-	}*/
+	}
+#endif
 
 	int iters = 0;
 	while (true) {
@@ -539,27 +577,33 @@ unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int
 		dim3 grid_dims((int)ceil(cols / (float) 32), (int)ceil(rows / (float)32));
 		naive_kernel<<<grid_dims, block_dims>>>(dev_image, rows, cols, radius, dev_centroids, dev_deltas, convergence_threshold);
 		
-		//err_code = cudaGetLastError(); //errors from launching the kernel
-		//err_code = cudaDeviceSynchronize(); //errors that happened during the kernel launch
+		err_code = cudaGetLastError(); //errors from launching the kernel
+		err_code = cudaDeviceSynchronize(); //errors that happened during the kernel launch
 		
-		/*{ //just for comparing against sequential "kernel"
-			cudaMemcpy(host_centroids, dev_centroids, rows * cols * sizeof(Point), cudaMemcpyDeviceToHost);
-			for (int r = 0; r < rows; r++) {
-				for (int c = 0; c < cols; c++) {
-					naive_kernel_internals(image_data, rows, cols, r, c, radius, seq_centroids, seq_deltas);
-					if (memcmp(&host_centroids[r * cols + c], &seq_centroids[r * cols + c], sizeof(Point))) {
-						fprintf(stderr, "centroid for r=%d, c=%d does not match\n", r, c);
-					}
-					if (host_deltas[r * cols + c] != seq_deltas[r * cols + c]) {
-						fprintf(stderr, "delta for r=%d, c=%d does not match, seq = %f, dev = %f\n", r, c, seq_deltas[r * cols + c], host_deltas[r * cols + c]);
-					}
+#ifdef COMPARE_GPU_AGAINST_SEQ
+		cudaMemcpy(host_centroids, dev_centroids, rows * cols * sizeof(Point), cudaMemcpyDeviceToHost);
+		cudaMemcpy(host_deltas, dev_deltas, rows * cols * sizeof(float), cudaMemcpyDeviceToHost);
+		for (int r = 0; r < rows; r++) {
+			for (int c = 0; c < cols; c++) {
+				naive_kernel_internals(image_data, rows, cols, r, c, radius, seq_centroids, seq_deltas, convergence_threshold);
+				/*if (memcmp(&host_centroids[r * cols + c], &seq_centroids[r * cols + c], sizeof(Point))) {
+					fprintf(stderr, "centroid for r=%d, c=%d does not match\n", r, c);
+				}*/
+				if (fabs(host_deltas[r * cols + c] - seq_deltas[r * cols + c]) > 0.1) {
+					Point host_centroid = host_centroids[r * cols + c],
+						seq_centroid = seq_centroids[r * cols + c];
+					fprintf(stderr, "iter %2d, delta for r=%4d, c=%4d does not match, seq = %f, dev = %f\nhost centroid = (%f,%f,%f,%f,%f), seq centroid = (%f,%f,%f,%f,%f)\n",
+						iters, r, c, seq_deltas[r * cols + c], host_deltas[r * cols + c],
+						host_centroid.r, host_centroid.g, host_centroid.b, host_centroid.row, host_centroid.col,
+						seq_centroid.r, seq_centroid.g, seq_centroid.b, seq_centroid.row, seq_centroid.col);
 				}
 			}
-		}*/
+		}
+#endif
 
 		//Faster code to check for convergence
 		//change this to do diagnostics on whole-warp convergence
-#if 1
+#ifdef USE_REDUCTION_KERNEL
 		int blocks_necessary = (int)ceil((float)(rows * cols) / 2048.0f); //1024 is max threads per block on my device
 		max_in_groups<<<blocks_necessary, 1024>>>(dev_deltas, rows * cols);
 		err_code = cudaGetLastError();
@@ -579,43 +623,15 @@ unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int
 		}
 		
 #else
-		float max_delta = 0.0f;
-		int amount_above_thresh = 0;
 		err_code = cudaMemcpy(host_deltas, dev_deltas, rows * cols * sizeof(float), cudaMemcpyDeviceToHost);
-		for (int r = 0; r < rows; r++) {
-			for (int c = 0; c < cols; c++) {
-				if (host_deltas[r * cols + c] > convergence_threshold) {
-					amount_above_thresh++;
-				}
-				if (host_deltas[r * cols + c] > max_delta) {
-					max_delta = host_deltas[r * cols + c];
-				}
+		bool all_below_threshold = true;
+		for (int i = 0; i < rows * cols; i++) {
+			if (host_deltas[i] > convergence_threshold) {
+				all_below_threshold = false;
+				break;
 			}
 		}
-		/*
-		* If I make the blocks 32x32, each warp handles a row of threads
-		* This checks if every thread in a warp would have converged
-		*/
-		int warps_converged = 0;
-		int total_warps = 0;
-		for (int r = 0; r < rows; r++) {
-			for (int warp = 0; warp < (cols + 31) / 32; warp++) {
-				total_warps++;
-				bool warp_entirely_converged = true;
-				for (int c = warp * 32; c < warp * 32 + 32 && c < cols; c++) {
-					if (host_deltas[r * cols + c] > convergence_threshold) {
-						warp_entirely_converged = false;
-						break;
-					}
-				}
-				if (warp_entirely_converged) {
-					warps_converged++;
-				}
-			}
-		}
-		fprintf(stderr, "Iteration %d has %d deltas > %f, %d / %d warps converged (%f%%)\n", iters++, amount_above_thresh, convergence_threshold,
-			warps_converged, total_warps, (float)warps_converged / (float)total_warps);
-		if (max_delta < convergence_threshold) {
+		if (all_below_threshold) {
 			break;
 		}
 #endif
@@ -636,28 +652,27 @@ unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int
 				}
 			}
 			if (cluster_id == -1) {
-				if (cluster_convergences.size() == 256) {
-					fprintf(stderr, "ERROR: more than 256 clusters identified, try tweaking CONVERGENCE_THRESHOLD and SEARCH_RADIUS\n");
-					assert(0);
-				}
 				cluster_convergences.push_back(host_centroids[r * cols + c]);
 				cluster_id = cluster_convergences.size() - 1;
 			}
-			result[(r * cols + c) * 3] = cluster_id;
+			cluster_ids[r * cols + c] = cluster_id;
 		}
 	}
-	if (do_color) color_result(image_data, result, cluster_convergences.size(), rows, cols);
+	if (do_color) color_result(image_data, result, cluster_ids, cluster_convergences.size(), rows, cols);
 	
 	free(host_centroids);
 	cudaFree(dev_centroids);
 	free(host_deltas);
 	cudaFree(dev_deltas);
 	cudaFree(dev_image);
+#ifdef COMPARE_GPU_AGAINST_SEQ
+	free(seq_centroids);
+	free(seq_deltas);
+#endif
 	return result;
 	
 }
-#define SEARCH_RADIUS 50
-#define CONVERGENCE_THRESHOLD 10
+
 
 void timings(const char* filename) {
 	std::cout << "Now timing on " << filename << std::endl;
@@ -668,9 +683,11 @@ void timings(const char* filename) {
 		return;
 	}
 
-	/*auto start = std::chrono::high_resolution_clock::now();
+	std::chrono::time_point < std::chrono::high_resolution_clock > start, end;
+
+	/*start = std::chrono::high_resolution_clock::now();
 	cpu_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, false);
-	auto end = std::chrono::high_resolution_clock::now();
+	end = std::chrono::high_resolution_clock::now();
 	printf("naive CPU: %10lldms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());*/
 
 	/*start = std::chrono::high_resolution_clock::now();
@@ -683,19 +700,20 @@ void timings(const char* filename) {
 	//end = std::chrono::high_resolution_clock::now();
 	//printf("seq GPU  : %10lldms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
 
-	auto start = std::chrono::high_resolution_clock::now();
+	start = std::chrono::high_resolution_clock::now();
 	naive_GPU_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, false);
-	auto end = std::chrono::high_resolution_clock::now();
+	end = std::chrono::high_resolution_clock::now();
 	printf("naive GPU: %10lldms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
 }
 int main()
 {
 	//timings("test_images/dapper_lad_smaller.jpg");
-	timings("test_images/dapper_lad.jpg");
+	//timings("test_images/dapper_lad.jpg");
+	timings("test_images/campus.jpg");
 	return;
 
     int rows, cols, channels;
-    unsigned char* image_data = (unsigned char*)stbi_load("test_images/dapper_lad_smaller.jpg", &cols, &rows, &channels, 3);
+    unsigned char* image_data = (unsigned char*)stbi_load("test_images/campus.jpg", &cols, &rows, &channels, 3);
     if (!image_data) {
         fprintf(stderr, "Error reading image: %s\n", stbi_failure_reason());
         return -1;

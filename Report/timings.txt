@@ -1,6 +1,13 @@
-dapper_lad.jpg:
+dapper_lad.jpg, SEARCH_RADIUS=50, CONVERGENCE_THRESHOLD=10:
 naive CPU (kd trees):  45318 ms
 kd trees, with traj :  44386 ms
 naive GPU, bad reduc: 148198 ms
 naive GPU, good redc:   1138 ms
 ", with early stop  :    357 ms
+shmem GPU           :    362 ms
+
+campus.jpg SEARCH_RADIUS=100, CONVERGENCE_THRESHOLD=10:
+naive CPU (kd trees):	164606 ms
+kd trees, with trajec:	164214 ms
+naive GPU, good reduc:	  1402 ms
+", with early stop:	   751 ms

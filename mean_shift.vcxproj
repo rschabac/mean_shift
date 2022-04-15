@@ -67,6 +67,8 @@
       <Include>D:\cs677\opencv\build\include</Include>
       <GenerateLineInfo>false</GenerateLineInfo>
       <InterleaveSourceInPTX>true</InterleaveSourceInPTX>
+      <AdditionalOptions>-res-usage %(AdditionalOptions)</AdditionalOptions>
+      <MaxRegCount>64</MaxRegCount>
     </CudaCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -90,6 +92,7 @@
       <AdditionalCompilerOptions>
       </AdditionalCompilerOptions>
       <Include>D:\cs677\opencv\build\include</Include>
+      <AdditionalOptions>-res-usage %(AdditionalOptions)</AdditionalOptions>
     </CudaCompile>
   </ItemDefinitionGroup>
   <ItemGroup>

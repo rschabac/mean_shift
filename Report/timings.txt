@@ -6,8 +6,15 @@ naive GPU, good redc:   1138 ms
 ", with early stop  :    357 ms
 shmem GPU           :    362 ms
 
+//Not repeatable, maybe machine was less loaded?
 campus.jpg SEARCH_RADIUS=100, CONVERGENCE_THRESHOLD=10:
 naive CPU (kd trees):	164606 ms
 kd trees, with trajec:	164214 ms
 naive GPU, good reduc:	  1402 ms
 ", with early stop:	   751 ms
+
+campus.jpg SEARCH_RADIUS=50, CONVERGENCE_THRESHOLD=10:
+kd trees, with trajec	313878 ms
+naive GPU		  8529 ms
+naive GPU, early stop	  1579 ms
+shmem GPU		  1572 ms

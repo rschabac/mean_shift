@@ -50,10 +50,11 @@ struct Point {
 
 #define SEARCH_RADIUS 50
 #define CONVERGENCE_THRESHOLD 10
-#define USE_SHMEM
+//#define USE_SHMEM
 //#define COMPARE_GPU_AGAINST_SEQ
 #define EARLY_STOP
 #define USE_REDUCTION_KERNEL
+#define POINTS_IN_REGISTERS
 
 void add_point(struct kdtree* kd, Point p) {
 	//simplest way to handle errors
@@ -318,9 +319,8 @@ void naive_kernel_internals(const unsigned char* image, int rows, int cols, int 
 	deltas[r * cols + c] = distance_squared;
 }
 
-__global__ void naive_kernel(const unsigned char *image, int rows, int cols, float radius, Point *centroids, float *deltas, float convergence_threshold) {
-	int c = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y * blockDim.y + threadIdx.y;
-
+__global__ void naive_kernel(const unsigned char * const image, const int rows, const int cols, const float radius, Point * const centroids, float * const deltas, const float convergence_threshold) {
+	const int c = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y * blockDim.y + threadIdx.y;
 
 #ifdef USE_SHMEM
 	/*
@@ -368,16 +368,28 @@ __global__ void naive_kernel(const unsigned char *image, int rows, int cols, flo
 		return;
 	}
 #endif
-	Point new_centroid(0, 0, 0, 0, 0);
+
 	int num_neighbors = 0;
-	Point* this_centroid = &centroids[r * cols + c];
+	Point *this_centroid = &centroids[r * cols + c];
 	const float radius_squared = radius * radius;
+#ifdef POINTS_IN_REGISTERS
+	float new_r = 0.0f, new_g = 0.0f, new_b = 0.0f, new_row = 0.0f, new_col = 0.0f;
+	const float this_centroid_row = this_centroid->row,
+				this_centroid_col = this_centroid->col,
+				this_centroid_r = this_centroid->r,
+				this_centroid_g = this_centroid->g,
+				this_centroid_b = this_centroid->b;
+#else
+#define this_centroid_row (this_centroid->row)
+#define this_centroid_col (this_centroid->col)
+	Point new_centroid(0, 0, 0, 0, 0);
+#endif
 	for (int d_r = (int)floorf(-radius) - 1; d_r <= (int)ceilf(radius) + 1; d_r++) {
 		//float limit = sqrtf(radius * radius - d_r * d_r);
 		//for (int d_c = floorf(-limit); d_c <= ceilf(limit); d_c++) {
 		for (int d_c = (int)floorf(-radius) - 1; d_c <= (int)ceilf(radius) + 1; d_c++) {
 			if (d_r * d_r + d_c * d_c > radius_squared) continue;
-			int search_r = (int)floorf(this_centroid->row + d_r), search_c = (int)floorf(this_centroid->col + d_c);
+			const int search_r = (int)floorf(this_centroid_row + d_r), search_c = (int)floorf(this_centroid_col + d_c);
 			if (search_r < 0 || search_r >= rows || search_c < 0 || search_c >= cols) {
 				continue;
 			}
@@ -405,24 +417,67 @@ __global__ void naive_kernel(const unsigned char *image, int rows, int cols, flo
 			potential_neighbor.col = search_c;
 #else
 			const unsigned char* const base_of_pixel = &image[(search_r * cols + search_c) * 3];
+#ifdef POINTS_IN_REGISTERS
+			
+			float potential_r = base_of_pixel[0],
+				potential_g = base_of_pixel[1],
+				potential_b = base_of_pixel[2],
+				potential_row = search_r,
+				potential_col = search_c;
+#else
 			Point potential_neighbor(base_of_pixel[0], base_of_pixel[1], base_of_pixel[2], search_r, search_c);
 #endif
-			
+#endif
+#ifdef POINTS_IN_REGISTERS
+			const float delta_r = potential_r - this_centroid_r;
+			const float delta_g = potential_g - this_centroid_g;
+			const float delta_b = potential_b - this_centroid_b;
+			const float delta_row = potential_row - this_centroid_row;
+			const float delta_col = potential_col - this_centroid_col;
+			if (delta_r * delta_r + delta_g * delta_g + delta_b * delta_b + delta_row * delta_row + delta_col * delta_col <= radius_squared) {
+				num_neighbors++;
+				//fprintf(stderr, "pixel at r=%d, c=%d is a neighbor of centroid r=%f, c=%f\n", search_r, search_c, this_centroid->row, this_centroid->col);
+				new_r += potential_r;
+				new_g += potential_g;
+				new_b += potential_b;
+				new_row += potential_row;
+				new_col += potential_col;
+			}
+#else
 			float distance_squared = potential_neighbor.distance_squared(this_centroid);
 			if (distance_squared <= radius_squared) {
 				num_neighbors++;
-				//fprintf(stderr, "pixel at r=%d, c=%d is a neighbor of centroid r=%f, c=%f\n", search_r, search_c, this_centroid->row, this_centroid->col);
 				for (int i = 0; i < 5; i++) {
 					*new_centroid[i] += *potential_neighbor[i];
 				}
 			}
+#endif
 		}
 	}
+#ifdef POINTS_IN_REGISTERS
+	new_r /= num_neighbors;
+	new_g /= num_neighbors;
+	new_b /= num_neighbors;
+	new_row /= num_neighbors;
+	new_col /= num_neighbors;
+	const float delta_r = new_r - this_centroid_r;
+	const float delta_g = new_g - this_centroid_g;
+	const float delta_b = new_b - this_centroid_b;
+	const float delta_row = new_row - this_centroid_row;
+	const float delta_col = new_col - this_centroid_col;
+	float distance_squared = delta_r * delta_r + delta_g * delta_g + delta_b * delta_b + delta_row * delta_row + delta_col * delta_col;
+	this_centroid->r = new_r;
+	this_centroid->g = new_g;
+	this_centroid->b = new_b;
+	this_centroid->row = new_row;
+	this_centroid->col = new_col;
+#else
 	for (int i = 0; i < 5; i++) {
 		*new_centroid[i] /= num_neighbors;
 	}
-	float distance_squared = new_centroid.distance_squared(this_centroid);
+	const float distance_squared = new_centroid.distance_squared(this_centroid);
 	*this_centroid = new_centroid;
+#endif
 	/*if (deltas[r * cols + c] > distance_squared) {
 		fprintf(stderr, "delta for r=%d, c=%d got bigger, was %f, now is %f\n", r, c, deltas[r * cols + c], distance_squared);
 	}*/
@@ -530,6 +585,24 @@ __global__ void max_in_groups(float* data, int n) {
 	}
 }
 
+__global__ void kernel_without_deltas(const unsigned char* image, int rows, int cols, float radius, Point* centroids, float convergence_threshold, int *should_continue) {
+	int c = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y + blockDim.y + threadIdx.y;
+	/*
+	If a centroid has a negative .r value, return
+	Compute the delta for each centroid, as before
+	if it is less than the threshold, .r -= 256
+	otherwise, shared_flag = true;
+
+	__syncthreads();
+	thread 0 in each block checks shared_flag
+	if it is true, atomicOr(should_continue, true)
+	*/
+
+	if (r >= rows || c >= cols) {
+		return;
+	}
+}
+
 unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int cols, float radius, float convergence_threshold, bool do_color) {
 	unsigned char *result = (unsigned char*)malloc(rows * cols * 3);
 	int* cluster_ids = (int*)malloc(rows * cols * sizeof(int));
@@ -574,11 +647,13 @@ unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int
 		//fprintf(stderr, "now starting iter %d\n", iters++);
 		//My device (NVIDIA GeForce GTX 1660) has a max of 1024 threads per block
 		dim3 block_dims(32, 32);
-		dim3 grid_dims((int)ceil(cols / (float) 32), (int)ceil(rows / (float)32));
+		dim3 grid_dims((cols + 31)/32, (rows + 31)/32);
 		naive_kernel<<<grid_dims, block_dims>>>(dev_image, rows, cols, radius, dev_centroids, dev_deltas, convergence_threshold);
 		
+#ifdef _DEBUG
 		err_code = cudaGetLastError(); //errors from launching the kernel
 		err_code = cudaDeviceSynchronize(); //errors that happened during the kernel launch
+#endif
 		
 #ifdef COMPARE_GPU_AGAINST_SEQ
 		cudaMemcpy(host_centroids, dev_centroids, rows * cols * sizeof(Point), cudaMemcpyDeviceToHost);
@@ -606,8 +681,10 @@ unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int
 #ifdef USE_REDUCTION_KERNEL
 		int blocks_necessary = (int)ceil((float)(rows * cols) / 2048.0f); //1024 is max threads per block on my device
 		max_in_groups<<<blocks_necessary, 1024>>>(dev_deltas, rows * cols);
+#ifdef _DEBUG
 		err_code = cudaGetLastError();
 		err_code = cudaDeviceSynchronize();
+#endif
 		bool all_below_threshold = true;
 		//Maybe it would be faster to make one big array here and just do one memcpy into that
 		for (int i = 0; i < rows * cols; i += 2048) {
@@ -726,9 +803,9 @@ int main()
 	stbi_write_png("cpu_output_traj.png", cols, rows, 3, cpu_traj_result, 0);
 	free(cpu_traj_result);*/
 
-	unsigned char* sequential_kernel_result = sequential_gpu_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, true);
+	/*unsigned char* sequential_kernel_result = sequential_gpu_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, true);
 	stbi_write_png("sequential_output.png", cols, rows, 3, sequential_kernel_result, 0);
-	free(sequential_kernel_result);
+	free(sequential_kernel_result);*/
 
 	unsigned char * gpu_result = naive_GPU_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, true);
 	stbi_write_png("gpu_output.png", cols, rows, 3, gpu_result, 0);

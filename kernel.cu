@@ -52,9 +52,8 @@ struct Point {
 #define CONVERGENCE_THRESHOLD 10
 //#define USE_SHMEM
 //#define COMPARE_GPU_AGAINST_SEQ
-#define EARLY_STOP
 #define USE_REDUCTION_KERNEL
-#define POINTS_IN_REGISTERS
+#define USE_CONST_MEM
 
 void add_point(struct kdtree* kd, Point p) {
 	//simplest way to handle errors
@@ -277,12 +276,10 @@ void naive_kernel_internals(const unsigned char* image, int rows, int cols, int 
 	if (r >= rows || c >= cols) {
 		return;
 	}
-#ifdef EARLY_STOP
 	if (deltas[r * cols + c] <= convergence_threshold) {
 		//No need to keep iterating this centroid
 		return;
 	}
-#endif
 	Point new_centroid(0, 0, 0, 0, 0);
 	int num_neighbors = 0;
 	Point* this_centroid = &centroids[r * cols + c];
@@ -318,6 +315,13 @@ void naive_kernel_internals(const unsigned char* image, int rows, int cols, int 
 	}*/
 	deltas[r * cols + c] = distance_squared;
 }
+
+#ifdef USE_CONST_MEM
+//square const mem should be the best
+//65536 bytes, max dimension is 147
+#define CONST_MEM_DIM 147
+__constant__ unsigned char const_corner[CONST_MEM_DIM][CONST_MEM_DIM][3];
+#endif
 
 __global__ void naive_kernel(const unsigned char * const image, const int rows, const int cols, const float radius, Point * const centroids, float * const deltas, const float convergence_threshold) {
 	const int c = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y * blockDim.y + threadIdx.y;
@@ -363,27 +367,19 @@ __global__ void naive_kernel(const unsigned char * const image, const int rows, 
 	if (r >= rows || c >= cols) {
 		return;
 	}
-#ifdef EARLY_STOP
 	if (deltas[r * cols + c] <= convergence_threshold) {
 		return;
 	}
-#endif
 
 	int num_neighbors = 0;
 	Point *this_centroid = &centroids[r * cols + c];
 	const float radius_squared = radius * radius;
-#ifdef POINTS_IN_REGISTERS
 	float new_r = 0.0f, new_g = 0.0f, new_b = 0.0f, new_row = 0.0f, new_col = 0.0f;
 	const float this_centroid_row = this_centroid->row,
 				this_centroid_col = this_centroid->col,
 				this_centroid_r = this_centroid->r,
 				this_centroid_g = this_centroid->g,
 				this_centroid_b = this_centroid->b;
-#else
-#define this_centroid_row (this_centroid->row)
-#define this_centroid_col (this_centroid->col)
-	Point new_centroid(0, 0, 0, 0, 0);
-#endif
 	for (int d_r = (int)floorf(-radius) - 1; d_r <= (int)ceilf(radius) + 1; d_r++) {
 		//float limit = sqrtf(radius * radius - d_r * d_r);
 		//for (int d_c = floorf(-limit); d_c <= ceilf(limit); d_c++) {
@@ -416,45 +412,41 @@ __global__ void naive_kernel(const unsigned char * const image, const int rows, 
 			potential_neighbor.row = search_r;
 			potential_neighbor.col = search_c;
 #else
+#ifdef USE_CONST_MEM
+			float potential_r, potential_g, potential_b;
+			if (search_r < CONST_MEM_DIM && search_c < CONST_MEM_DIM) {
+				potential_r = const_corner[search_r][search_c][0];
+				potential_g = const_corner[search_r][search_c][1];
+				potential_b = const_corner[search_r][search_r][2];
+			} else {
+				const unsigned char* const base_of_pixel = &image[(search_r * cols + search_c) * 3];
+				potential_r = base_of_pixel[0];
+				potential_g = base_of_pixel[1];
+				potential_b = base_of_pixel[2];
+			}
+#else
 			const unsigned char* const base_of_pixel = &image[(search_r * cols + search_c) * 3];
-#ifdef POINTS_IN_REGISTERS
-			
 			float potential_r = base_of_pixel[0],
 				potential_g = base_of_pixel[1],
-				potential_b = base_of_pixel[2],
-				potential_row = search_r,
-				potential_col = search_c;
-#else
-			Point potential_neighbor(base_of_pixel[0], base_of_pixel[1], base_of_pixel[2], search_r, search_c);
+				potential_b = base_of_pixel[2];
 #endif
 #endif
-#ifdef POINTS_IN_REGISTERS
 			const float delta_r = potential_r - this_centroid_r;
 			const float delta_g = potential_g - this_centroid_g;
 			const float delta_b = potential_b - this_centroid_b;
-			const float delta_row = potential_row - this_centroid_row;
-			const float delta_col = potential_col - this_centroid_col;
+			const float delta_row = search_r - this_centroid_row;
+			const float delta_col = search_c - this_centroid_col;
 			if (delta_r * delta_r + delta_g * delta_g + delta_b * delta_b + delta_row * delta_row + delta_col * delta_col <= radius_squared) {
 				num_neighbors++;
 				//fprintf(stderr, "pixel at r=%d, c=%d is a neighbor of centroid r=%f, c=%f\n", search_r, search_c, this_centroid->row, this_centroid->col);
 				new_r += potential_r;
 				new_g += potential_g;
 				new_b += potential_b;
-				new_row += potential_row;
-				new_col += potential_col;
+				new_row += search_r;
+				new_col += search_c;
 			}
-#else
-			float distance_squared = potential_neighbor.distance_squared(this_centroid);
-			if (distance_squared <= radius_squared) {
-				num_neighbors++;
-				for (int i = 0; i < 5; i++) {
-					*new_centroid[i] += *potential_neighbor[i];
-				}
-			}
-#endif
 		}
 	}
-#ifdef POINTS_IN_REGISTERS
 	new_r /= num_neighbors;
 	new_g /= num_neighbors;
 	new_b /= num_neighbors;
@@ -471,16 +463,7 @@ __global__ void naive_kernel(const unsigned char * const image, const int rows, 
 	this_centroid->b = new_b;
 	this_centroid->row = new_row;
 	this_centroid->col = new_col;
-#else
-	for (int i = 0; i < 5; i++) {
-		*new_centroid[i] /= num_neighbors;
-	}
-	const float distance_squared = new_centroid.distance_squared(this_centroid);
-	*this_centroid = new_centroid;
-#endif
-	/*if (deltas[r * cols + c] > distance_squared) {
-		fprintf(stderr, "delta for r=%d, c=%d got bigger, was %f, now is %f\n", r, c, deltas[r * cols + c], distance_squared);
-	}*/
+
 	deltas[r * cols + c] = distance_squared;
 }
 
@@ -630,6 +613,11 @@ unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int
 	unsigned char *dev_image = NULL;
 	err_code = cudaMalloc((void**)&dev_image, rows * cols * 3);
 	err_code = cudaMemcpy(dev_image, image_data, rows * cols * 3, cudaMemcpyHostToDevice);
+#ifdef USE_CONST_MEM
+	for (int r = 0; r < CONST_MEM_DIM; r++) {
+		err_code = cudaMemcpyToSymbol(const_corner, &image_data[r * cols], 3 * CONST_MEM_DIM, r * CONST_MEM_DIM * 3, cudaMemcpyHostToDevice);
+	}
+#endif
 	
 #ifdef COMPARE_GPU_AGAINST_SEQ
 	Point* seq_centroids = (Point*)malloc(rows * cols * sizeof(Point));

@@ -5,4 +5,5 @@ cpu_output.*
 gpu_output.*
 sequential_output.*
 cpu_output_traj.*
+no_delta_output.*
 *.nvsettings

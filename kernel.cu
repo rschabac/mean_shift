@@ -53,8 +53,9 @@ struct Point {
 //#define USE_SHMEM
 //#define COMPARE_GPU_AGAINST_SEQ
 #define USE_REDUCTION_KERNEL
-//#define USE_CONST_MEM
 //#define USE_ATOMICS
+//#define TIME_ITERS
+#define USE_TEX_MEM
 
 void add_point(struct kdtree* kd, Point p) {
 	//simplest way to handle errors
@@ -317,13 +318,6 @@ void naive_kernel_internals(const unsigned char* image, int rows, int cols, int 
 	deltas[r * cols + c] = distance_squared;
 }
 
-#ifdef USE_CONST_MEM
-//square const mem should be the best
-//65536 bytes, max dimension is 147
-#define CONST_MEM_DIM 147
-__constant__ unsigned char const_corner[CONST_MEM_DIM][CONST_MEM_DIM][3];
-#endif
-
 __global__ void naive_kernel(const unsigned char * const image, const int rows, const int cols, const float radius, Point * const centroids, float * const deltas, const float convergence_threshold) {
 	const int c = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -391,7 +385,7 @@ __global__ void naive_kernel(const unsigned char * const image, const int rows, 
 				continue;
 			}
 #ifdef USE_SHMEM
-			Point potential_neighbor;
+			float potential_r, potential_g, potential_b;
 			/*
 			if blockidx = {2,2}, shared[0][0] is image[64-SH_PAD][64-SH_PAD]
 			shared[SH_PAD][SH_PAD] is image[64][64]
@@ -401,24 +395,9 @@ __global__ void naive_kernel(const unsigned char * const image, const int rows, 
 			const int shared_r = search_r - 32 * blockIdx.y + SH_PAD,
 				shared_c = search_c - 32 * blockIdx.x + SH_PAD;
 			if (shared_r >= 0 && shared_r < SH_DIM && shared_c >= 0 && shared_c < SH_DIM) {
-				potential_neighbor.r = shared[shared_r][shared_c][0];
-				potential_neighbor.g = shared[shared_r][shared_c][1];
-				potential_neighbor.b = shared[shared_r][shared_c][2];
-			} else {
-				const unsigned char* const base_of_pixel = &image[(search_r * cols + search_c) * 3];
-				potential_neighbor.r = base_of_pixel[0];
-				potential_neighbor.g = base_of_pixel[1];
-				potential_neighbor.b = base_of_pixel[2];
-			}
-			potential_neighbor.row = search_r;
-			potential_neighbor.col = search_c;
-#else
-#ifdef USE_CONST_MEM
-			float potential_r, potential_g, potential_b;
-			if (search_r < CONST_MEM_DIM && search_c < CONST_MEM_DIM) {
-				potential_r = const_corner[search_r][search_c][0];
-				potential_g = const_corner[search_r][search_c][1];
-				potential_b = const_corner[search_r][search_r][2];
+				potential_r = shared[shared_r][shared_c][0];
+				potential_g = shared[shared_r][shared_c][1];
+				potential_b = shared[shared_r][shared_c][2];
 			} else {
 				const unsigned char* const base_of_pixel = &image[(search_r * cols + search_c) * 3];
 				potential_r = base_of_pixel[0];
@@ -430,7 +409,6 @@ __global__ void naive_kernel(const unsigned char * const image, const int rows, 
 			float potential_r = base_of_pixel[0],
 				potential_g = base_of_pixel[1],
 				potential_b = base_of_pixel[2];
-#endif
 #endif
 			const float delta_r = potential_r - this_centroid_r;
 			const float delta_g = potential_g - this_centroid_g;
@@ -466,6 +444,11 @@ __global__ void naive_kernel(const unsigned char * const image, const int rows, 
 	this_centroid->col = new_col;
 
 	deltas[r * cols + c] = distance_squared;
+#ifdef USE_SHMEM
+#undef SH_PAD
+#undef SH_DIM
+#undef RESP_DIM
+#endif
 }
 
 unsigned char* sequential_gpu_version(const unsigned char* image_data, int rows, int cols, float radius, float convergence_threshold, bool do_color) {
@@ -570,7 +553,12 @@ __global__ void max_in_groups(float* data, int n) {
 }
 
 __device__ int need_more_iter;
-__global__ void kernel_without_deltas(const unsigned char* image, int rows, int cols, float radius, Point* centroids, float convergence_threshold) {
+
+__global__ void kernel_without_deltas(const unsigned char* image, int rows, int cols, float radius, Point* centroids, float convergence_threshold
+#ifdef USE_TEX_MEM
+	, cudaTextureObject_t tex
+#endif
+	) {
 	int c = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y * blockDim.y + threadIdx.y;
 	/*
 	If a centroid has a negative .r value, return
@@ -616,10 +604,17 @@ __global__ void kernel_without_deltas(const unsigned char* image, int rows, int 
 			if (search_r < 0 || search_r >= rows || search_c < 0 || search_c >= cols) {
 				continue;
 			}
+#ifdef USE_TEX_MEM
+			const float potential_r = 255.0f * tex3D<float>(tex, search_r/(float)rows, search_c/(float)cols, 0.0f),
+						potential_g = 255.0f * tex3D<float>(tex, search_r/(float)rows, search_c/(float)cols, 1.0f),
+						potential_b = 255.0f * tex3D<float>(tex, search_r/(float)rows, search_c/(float)cols, 2.0f);
+#else
 			const unsigned char* const base_of_pixel = &image[(search_r * cols + search_c) * 3];
 			float potential_r = base_of_pixel[0],
 				potential_g = base_of_pixel[1],
 				potential_b = base_of_pixel[2];
+#endif
+			
 			const float delta_r = potential_r - this_centroid_r;
 			const float delta_g = potential_g - this_centroid_g;
 			const float delta_b = potential_b - this_centroid_b;
@@ -705,11 +700,6 @@ unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int
 	unsigned char *dev_image = NULL;
 	err_code = cudaMalloc((void**)&dev_image, rows * cols * 3);
 	err_code = cudaMemcpy(dev_image, image_data, rows * cols * 3, cudaMemcpyHostToDevice);
-#ifdef USE_CONST_MEM
-	for (int r = 0; r < CONST_MEM_DIM; r++) {
-		err_code = cudaMemcpyToSymbol(const_corner, &image_data[r * cols], 3 * CONST_MEM_DIM, r * CONST_MEM_DIM * 3, cudaMemcpyHostToDevice);
-	}
-#endif
 	
 #ifdef COMPARE_GPU_AGAINST_SEQ
 	Point* seq_centroids = (Point*)malloc(rows * cols * sizeof(Point));
@@ -721,9 +711,13 @@ unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int
 		memcpy(seq_centroids, host_centroids, rows * cols * sizeof(Point));
 	}
 #endif
-
-	int iters = 0;
-	while (true) {
+#ifdef TIME_ITERS
+	std::chrono::time_point<std::chrono::high_resolution_clock> start, end;
+#endif
+	for (int iters = 0; ; iters++) {
+#ifdef TIME_ITERS
+		start = std::chrono::high_resolution_clock::now();
+#endif
 		//fprintf(stderr, "now starting iter %d\n", iters++);
 		//My device (NVIDIA GeForce GTX 1660) has a max of 1024 threads per block
 		dim3 block_dims(32, 32);
@@ -775,6 +769,10 @@ unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int
 				break;
 			}
 		}
+#ifdef TIME_ITERS
+		end = std::chrono::high_resolution_clock::now();
+		printf("iter %d took %5ld ms\n", iters, std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+#endif
 		if (all_below_threshold) {
 			break;
 		}
@@ -792,7 +790,6 @@ unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int
 			break;
 		}
 #endif
-		iters++;
 	}
 	
 	err_code = cudaMemcpy(host_centroids, dev_centroids, rows * cols * sizeof(Point), cudaMemcpyDeviceToHost);
@@ -850,25 +847,63 @@ unsigned char* no_deltas_version(const unsigned char* image_data, int rows, int 
 	err_code = cudaMalloc((void**)&dev_image, rows * cols * 3);
 	err_code = cudaMemcpy(dev_image, image_data, rows * cols * 3, cudaMemcpyHostToDevice);
 
-	int iters = 0;
-	while (true) {
+#ifdef USE_TEX_MEM
+	cudaResourceViewDesc view_desc;
+	memset(&view_desc, 0, sizeof(view_desc));
+	view_desc.format = cudaResViewFormatUnsignedChar1;
+	view_desc.width = cols;
+	view_desc.height = rows;
+	view_desc.depth = 3;
+	cudaResourceDesc res_desc;
+	res_desc.resType = cudaResourceTypeLinear;
+	res_desc.res.linear.devPtr = dev_image; //I'm hoping cudaMalloc will align this correctly
+	res_desc.res.linear.sizeInBytes = rows * cols * 3;
+	res_desc.res.linear.desc = cudaCreateChannelDesc<unsigned char>();
+	cudaTextureDesc tex_desc;
+	memset(&tex_desc, 0, sizeof(tex_desc));
+	tex_desc.readMode = cudaReadModeNormalizedFloat;
+	tex_desc.sRGB = 0;
+	tex_desc.normalizedCoords = 1; //all coords need to be lerped to [0.0, 1.0 - 1/N]
+	tex_desc.disableTrilinearOptimization = 1; //Not sure what this is, but probably don't want it
+	cudaTextureObject_t tex;
+	err_code = cudaCreateTextureObject(&tex, &res_desc, &tex_desc, &view_desc);
+#endif
+
+#ifdef TIME_ITERS
+	std::chrono::time_point<std::chrono::high_resolution_clock> start, end;
+#endif
+	for (int iters = 0; ; iters++) {
+#ifdef TIME_ITERS
+		start = std::chrono::high_resolution_clock::now();
+#endif
 		dim3 block_dims(32, 32);
 		dim3 grid_dims((cols + 31) / 32, (rows + 31) / 32);
 		int should_continue_host = 0;
 		err_code = cudaMemcpyToSymbol(need_more_iter, &should_continue_host, sizeof(int), 0, cudaMemcpyHostToDevice);
-		kernel_without_deltas << <grid_dims, block_dims >> > (dev_image, rows, cols, radius, dev_centroids, convergence_threshold);
+		kernel_without_deltas << <grid_dims, block_dims >> > (dev_image, rows, cols, radius, dev_centroids, convergence_threshold
+#ifdef USE_TEX_MEM
+			, tex
+#endif
+			);
 #ifdef _DEBUG
 		err_code = cudaGetLastError();
 		err_code = cudaDeviceSynchronize();
 #endif
 		err_code = cudaMemcpyFromSymbol(&should_continue_host, need_more_iter, sizeof(int), 0, cudaMemcpyDeviceToHost);
+#ifdef TIME_ITERS
+		end = std::chrono::high_resolution_clock::now();
+		printf("iter %d took %5ld ms\n", iters, std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+#endif
 		if (!should_continue_host) {
 			break;
 		}
 		/*printf("press enter to do next iter...");
 		getchar();*/
-		iters++;
 	}
+
+#ifdef USE_TEX_MEM
+	cudaDestroyTextureObject(tex);
+#endif
 	
 	err_code = cudaMemcpy(host_centroids, dev_centroids, rows * cols * sizeof(Point), cudaMemcpyDeviceToHost);
 	for (int i = 0; i < rows * cols; i++) {
@@ -934,10 +969,10 @@ void timings(const char* filename) {
 	//end = std::chrono::high_resolution_clock::now();
 	//printf("seq GPU  : %10lldms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
 
-	/*start = std::chrono::high_resolution_clock::now();
+	start = std::chrono::high_resolution_clock::now();
 	naive_GPU_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, false);
 	end = std::chrono::high_resolution_clock::now();
-	printf("naive GPU: %10lldms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());*/
+	printf("naive GPU: %10lldms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
 
 	start = std::chrono::high_resolution_clock::now();
 	no_deltas_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, false);
@@ -948,8 +983,8 @@ int main()
 {
 	//timings("test_images/dapper_lad_smaller.jpg");
 	//timings("test_images/dapper_lad.jpg");
-	timings("test_images/campus.jpg");
-	return;
+	//timings("test_images/campus.jpg");
+	//return;
 
     int rows, cols, channels;
     unsigned char* image_data = (unsigned char*)stbi_load("test_images/campus.jpg", &cols, &rows, &channels, 3);

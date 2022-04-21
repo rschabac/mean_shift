@@ -69,6 +69,7 @@
       <InterleaveSourceInPTX>true</InterleaveSourceInPTX>
       <AdditionalOptions>-res-usage %(AdditionalOptions)</AdditionalOptions>
       <MaxRegCount>64</MaxRegCount>
+      <CodeGeneration>compute_75,sm_75</CodeGeneration>
     </CudaCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -93,6 +94,7 @@
       </AdditionalCompilerOptions>
       <Include>D:\cs677\opencv\build\include</Include>
       <AdditionalOptions>-res-usage %(AdditionalOptions)</AdditionalOptions>
+      <CodeGeneration>compute_75,sm_75</CodeGeneration>
     </CudaCompile>
   </ItemDefinitionGroup>
   <ItemGroup>

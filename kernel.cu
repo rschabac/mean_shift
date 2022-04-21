@@ -55,7 +55,8 @@ struct Point {
 #define USE_REDUCTION_KERNEL
 //#define USE_ATOMICS
 //#define TIME_ITERS
-#define USE_TEX_MEM
+//#define USE_TEX_MEM
+#define RESTRICT __restrict
 
 void add_point(struct kdtree* kd, Point p) {
 	//simplest way to handle errors
@@ -554,7 +555,7 @@ __global__ void max_in_groups(float* data, int n) {
 
 __device__ int need_more_iter;
 
-__global__ void kernel_without_deltas(const unsigned char* image, int rows, int cols, float radius, Point* centroids, float convergence_threshold
+__global__ void kernel_without_deltas(const unsigned char* RESTRICT image, int rows, int cols, float radius, Point* centroids, float convergence_threshold
 #ifdef USE_TEX_MEM
 	, cudaTextureObject_t tex
 #endif
@@ -983,8 +984,8 @@ int main()
 {
 	//timings("test_images/dapper_lad_smaller.jpg");
 	//timings("test_images/dapper_lad.jpg");
-	//timings("test_images/campus.jpg");
-	//return;
+	timings("test_images/campus.jpg");
+	return;
 
     int rows, cols, channels;
     unsigned char* image_data = (unsigned char*)stbi_load("test_images/campus.jpg", &cols, &rows, &channels, 3);

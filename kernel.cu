@@ -4,7 +4,6 @@
 
 #include <stdio.h>
 #include <chrono>
-#include <iostream>
 #include <vector>
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -48,15 +47,9 @@ struct Point {
 
 //CONFIG
 
-#define SEARCH_RADIUS 50
-#define CONVERGENCE_THRESHOLD 10
-//#define USE_SHMEM
-//#define COMPARE_GPU_AGAINST_SEQ
-#define USE_REDUCTION_KERNEL
-//#define USE_ATOMICS
 //#define TIME_ITERS
-//#define USE_TEX_MEM
 #define RESTRICT __restrict
+//#define RESTRICT
 
 void add_point(struct kdtree* kd, Point p) {
 	//simplest way to handle errors
@@ -275,7 +268,7 @@ void color_result(const unsigned char *image_data, unsigned char *result, int *c
 	}
 }
 
-void naive_kernel_internals(const unsigned char* image, int rows, int cols, int r, int c, float radius, Point* centroids, float* deltas, float convergence_threshold) {
+void naive_kernel_internals(const unsigned char* RESTRICT image, int rows, int cols, int r, int c, float radius, Point* centroids, float* deltas, float convergence_threshold) {
 	if (r >= rows || c >= cols) {
 		return;
 	}
@@ -319,10 +312,120 @@ void naive_kernel_internals(const unsigned char* image, int rows, int cols, int 
 	deltas[r * cols + c] = distance_squared;
 }
 
-__global__ void naive_kernel(const unsigned char * const image, const int rows, const int cols, const float radius, Point * const centroids, float * const deltas, const float convergence_threshold) {
+template <bool EarlyStop>
+__global__ void first_kernel(const unsigned char * const RESTRICT image, const int rows, const int cols, const float radius, Point * const centroids, float * const deltas, const float convergence_threshold) {
+	const int c = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y * blockDim.y + threadIdx.y;
+	if (r >= rows || c >= cols) {
+		return;
+	}
+	if constexpr (EarlyStop) {
+		if (deltas[r * cols + c] <= convergence_threshold) {
+			return;
+		}
+	}
+
+	int num_neighbors = 0;
+	Point *this_centroid = &centroids[r * cols + c];
+	const float radius_squared = radius * radius;
+	Point new_centroid(0, 0, 0, 0, 0);
+	for (int d_r = (int)floorf(-radius) - 1; d_r <= (int)ceilf(radius) + 1; d_r++) {
+		float limit = sqrtf(radius * radius - d_r * d_r);
+		for (int d_c = floorf(-limit); d_c <= ceilf(limit); d_c++) {
+		//for (int d_c = (int)floorf(-radius) - 1; d_c <= (int)ceilf(radius) + 1; d_c++) {
+			if (d_r * d_r + d_c * d_c > radius_squared) continue;
+			const int search_r = (int)floorf(this_centroid->row + d_r), search_c = (int)floorf(this_centroid->col + d_c);
+			if (search_r < 0 || search_r >= rows || search_c < 0 || search_c >= cols) {
+				continue;
+			}
+			const unsigned char* const base_of_pixel = &image[(search_r * cols + search_c) * 3];
+			Point potential_neighbor(base_of_pixel[0], base_of_pixel[1], base_of_pixel[2], search_r, search_c);
+			if (potential_neighbor.distance_squared(this_centroid) <= radius_squared) {
+				num_neighbors++;
+				for (int i = 0; i < 5; i++) {
+					*new_centroid[i] += *potential_neighbor[i];
+				}
+			}
+		}
+	}
+	for (int i = 0; i < 5; i++) {
+		*new_centroid[i] /= num_neighbors;
+	}
+	const float distance_squared = new_centroid.distance_squared(this_centroid);
+	*this_centroid = new_centroid;
+
+	deltas[r * cols + c] = distance_squared;
+}
+
+__global__ void reg_points_kernel(const unsigned char * const RESTRICT image, const int rows, const int cols, const float radius, Point * const centroids, float * const deltas, const float convergence_threshold) {
+	const int c = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y * blockDim.y + threadIdx.y;
+	if (r >= rows || c >= cols) {
+		return;
+	}
+	if (deltas[r * cols + c] <= convergence_threshold) {
+		return;
+	}
+
+	int num_neighbors = 0;
+	Point *this_centroid = &centroids[r * cols + c];
+	const float radius_squared = radius * radius;
+	float new_r = 0.0f, new_g = 0.0f, new_b = 0.0f, new_row = 0.0f, new_col = 0.0f;
+	const float this_centroid_row = this_centroid->row,
+				this_centroid_col = this_centroid->col,
+				this_centroid_r = this_centroid->r,
+				this_centroid_g = this_centroid->g,
+				this_centroid_b = this_centroid->b;
+	for (int d_r = (int)floorf(-radius) - 1; d_r <= (int)ceilf(radius) + 1; d_r++) {
+		float limit = sqrtf(radius * radius - d_r * d_r);
+		for (int d_c = floorf(-limit); d_c <= ceilf(limit); d_c++) {
+			if (d_r * d_r + d_c * d_c > radius_squared) continue;
+			const int search_r = (int)floorf(this_centroid_row + d_r), search_c = (int)floorf(this_centroid_col + d_c);
+			if (search_r < 0 || search_r >= rows || search_c < 0 || search_c >= cols) {
+				continue;
+			}
+			const unsigned char* const base_of_pixel = &image[(search_r * cols + search_c) * 3];
+			float potential_r = base_of_pixel[0],
+				potential_g = base_of_pixel[1],
+				potential_b = base_of_pixel[2];
+			const float delta_r = potential_r - this_centroid_r;
+			const float delta_g = potential_g - this_centroid_g;
+			const float delta_b = potential_b - this_centroid_b;
+			const float delta_row = search_r - this_centroid_row;
+			const float delta_col = search_c - this_centroid_col;
+			if (delta_r * delta_r + delta_g * delta_g + delta_b * delta_b + delta_row * delta_row + delta_col * delta_col <= radius_squared) {
+				num_neighbors++;
+				//fprintf(stderr, "pixel at r=%d, c=%d is a neighbor of centroid r=%f, c=%f\n", search_r, search_c, this_centroid->row, this_centroid->col);
+				new_r += potential_r;
+				new_g += potential_g;
+				new_b += potential_b;
+				new_row += search_r;
+				new_col += search_c;
+			}
+		}
+	}
+	new_r /= num_neighbors;
+	new_g /= num_neighbors;
+	new_b /= num_neighbors;
+	new_row /= num_neighbors;
+	new_col /= num_neighbors;
+	const float delta_r = new_r - this_centroid_r;
+	const float delta_g = new_g - this_centroid_g;
+	const float delta_b = new_b - this_centroid_b;
+	const float delta_row = new_row - this_centroid_row;
+	const float delta_col = new_col - this_centroid_col;
+	const float distance_squared = delta_r * delta_r + delta_g * delta_g + delta_b * delta_b + delta_row * delta_row + delta_col * delta_col;
+	this_centroid->r = new_r;
+	this_centroid->g = new_g;
+	this_centroid->b = new_b;
+	this_centroid->row = new_row;
+	this_centroid->col = new_col;
+
+	deltas[r * cols + c] = distance_squared;
+}
+
+template <size_t SH_PAD>
+__global__ void shmem_kernel(const unsigned char * const RESTRICT image, const int rows, const int cols, const float radius, Point * const centroids, float * const deltas, const float convergence_threshold) {
 	const int c = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y * blockDim.y + threadIdx.y;
 
-#ifdef USE_SHMEM
 	/*
 	* Each block is 32x32
 	* My initial guess for SEARCH_RADIUS is 50
@@ -332,12 +435,11 @@ __global__ void naive_kernel(const unsigned char * const image, const int rows, 
 	* More shared mem means less L1, try varying shared mem dimensions
 	* Should be at least 32x32?
 	*/
-//number of pixels beyond the 32x32 that should be in shared memory
-#define SH_PAD 48
-//total dimension length of shared memory
-#define SH_DIM (32 + 2*SH_PAD)
-//Each thread is responsible for loading this many (squared) pixels
-#define RESP_DIM ((SH_DIM + 31) / 32)
+	//SH_PAD is number of pixels beyond the 32x32 that should be in shared memory
+	//total dimension length of shared memory
+	constexpr size_t SH_DIM = 32 + 2 * SH_PAD;
+	//Each thread is responsible for loading this many (squared) pixels
+	constexpr size_t RESP_DIM = (SH_DIM + 31) / 32;
 	__shared__ unsigned char shared[SH_DIM][SH_DIM][3];
 	for (int r_offset = 0; r_offset < RESP_DIM; r_offset++) {
 		for (int c_offset = 0; c_offset < RESP_DIM; c_offset++) {
@@ -357,7 +459,6 @@ __global__ void naive_kernel(const unsigned char * const image, const int rows, 
 		}
 	}
 	__syncthreads();
-#endif
 	//This needs to happen after shmem is populated because out of bounds threads
 	//could still responsible for some in-bounds shmem items
 	if (r >= rows || c >= cols) {
@@ -385,7 +486,6 @@ __global__ void naive_kernel(const unsigned char * const image, const int rows, 
 			if (search_r < 0 || search_r >= rows || search_c < 0 || search_c >= cols) {
 				continue;
 			}
-#ifdef USE_SHMEM
 			float potential_r, potential_g, potential_b;
 			/*
 			if blockidx = {2,2}, shared[0][0] is image[64-SH_PAD][64-SH_PAD]
@@ -405,12 +505,6 @@ __global__ void naive_kernel(const unsigned char * const image, const int rows, 
 				potential_g = base_of_pixel[1];
 				potential_b = base_of_pixel[2];
 			}
-#else
-			const unsigned char* const base_of_pixel = &image[(search_r * cols + search_c) * 3];
-			float potential_r = base_of_pixel[0],
-				potential_g = base_of_pixel[1],
-				potential_b = base_of_pixel[2];
-#endif
 			const float delta_r = potential_r - this_centroid_r;
 			const float delta_g = potential_g - this_centroid_g;
 			const float delta_b = potential_b - this_centroid_b;
@@ -418,7 +512,6 @@ __global__ void naive_kernel(const unsigned char * const image, const int rows, 
 			const float delta_col = search_c - this_centroid_col;
 			if (delta_r * delta_r + delta_g * delta_g + delta_b * delta_b + delta_row * delta_row + delta_col * delta_col <= radius_squared) {
 				num_neighbors++;
-				//fprintf(stderr, "pixel at r=%d, c=%d is a neighbor of centroid r=%f, c=%f\n", search_r, search_c, this_centroid->row, this_centroid->col);
 				new_r += potential_r;
 				new_g += potential_g;
 				new_b += potential_b;
@@ -445,11 +538,6 @@ __global__ void naive_kernel(const unsigned char * const image, const int rows, 
 	this_centroid->col = new_col;
 
 	deltas[r * cols + c] = distance_squared;
-#ifdef USE_SHMEM
-#undef SH_PAD
-#undef SH_DIM
-#undef RESP_DIM
-#endif
 }
 
 unsigned char* sequential_gpu_version(const unsigned char* image_data, int rows, int cols, float radius, float convergence_threshold, bool do_color) {
@@ -470,7 +558,7 @@ unsigned char* sequential_gpu_version(const unsigned char* image_data, int rows,
 		}
 	}
 	
-	int iters = 0;
+	//int iters = 0;
 	while (true) {
 		for (int r = 0; r < rows; r++) {
 			for (int c = 0; c < cols; c++) {
@@ -555,12 +643,9 @@ __global__ void max_in_groups(float* data, int n) {
 
 __device__ int need_more_iter;
 
-__global__ void kernel_without_deltas(const unsigned char* RESTRICT image, int rows, int cols, float radius, Point* centroids, float convergence_threshold
-#ifdef USE_TEX_MEM
-	, cudaTextureObject_t tex
-#endif
-	) {
-	int c = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y * blockDim.y + threadIdx.y;
+template <bool UseAtomics>
+__global__ void kernel_without_deltas(const unsigned char* const RESTRICT image, const int rows, const int cols, const float radius, Point* const centroids, const float convergence_threshold) {
+	const int c = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y * blockDim.y + threadIdx.y;
 	/*
 	If a centroid has a negative .r value, return
 	Compute the delta for each centroid, as before
@@ -572,23 +657,24 @@ __global__ void kernel_without_deltas(const unsigned char* RESTRICT image, int r
 	if it is true, atomicOr(should_continue, true)
 	*/
 	__shared__ int need_more_shared;
-#ifdef USE_ATOMICS
-	if (threadIdx.x == 0 && threadIdx.y == 0) {
-		need_more_shared = 0;
+	if constexpr (UseAtomics) {
+		if (threadIdx.x == 0 && threadIdx.y == 0) {
+			need_more_shared = 0;
+		}
 	}
-#endif
+
 	if (r >= rows || c >= cols) {
 		return;
 	}
-	Point* this_centroid = &centroids[r * cols + c];
+	Point* const this_centroid = &centroids[r * cols + c];
 	if (this_centroid->r < 0) {
 		return;
 	}
-#ifdef USE_ATOMICS
-	__syncthreads();
-#else
-	need_more_shared = 0;
-#endif
+	if constexpr (UseAtomics) {
+		__syncthreads();
+	} else {
+		need_more_shared = 0;
+	}
 	
 	int num_neighbors = 0;
 	const float radius_squared = radius * radius;
@@ -605,16 +691,10 @@ __global__ void kernel_without_deltas(const unsigned char* RESTRICT image, int r
 			if (search_r < 0 || search_r >= rows || search_c < 0 || search_c >= cols) {
 				continue;
 			}
-#ifdef USE_TEX_MEM
-			const float potential_r = 255.0f * tex3D<float>(tex, search_r/(float)rows, search_c/(float)cols, 0.0f),
-						potential_g = 255.0f * tex3D<float>(tex, search_r/(float)rows, search_c/(float)cols, 1.0f),
-						potential_b = 255.0f * tex3D<float>(tex, search_r/(float)rows, search_c/(float)cols, 2.0f);
-#else
 			const unsigned char* const base_of_pixel = &image[(search_r * cols + search_c) * 3];
-			float potential_r = base_of_pixel[0],
+			const float potential_r = base_of_pixel[0],
 				potential_g = base_of_pixel[1],
 				potential_b = base_of_pixel[2];
-#endif
 			
 			const float delta_r = potential_r - this_centroid_r;
 			const float delta_g = potential_g - this_centroid_g;
@@ -648,11 +728,11 @@ __global__ void kernel_without_deltas(const unsigned char* RESTRICT image, int r
 		//this centroid has converged, do no further processing on it
 		new_r -= 256;
 	} else if (!need_more_shared) {
-#ifdef USE_ATOMICS
-		atomicOr(&need_more_shared, 1);
-#else
-		need_more_shared = 1;
-#endif
+		if constexpr (UseAtomics) {
+			atomicOr(&need_more_shared, 1);
+		} else {
+			need_more_shared = 1;
+		}
 	}
 	this_centroid->r = new_r;
 	this_centroid->g = new_g;
@@ -665,16 +745,23 @@ __global__ void kernel_without_deltas(const unsigned char* RESTRICT image, int r
 	Can't always choose thread (0,0) in the block, this may have already returned
 	*/
 	if (need_more_shared) {
-#ifdef USE_ATOMICS
-		atomicOr(&need_more_iter, 1);
-#else
-		need_more_iter = 1;
-#endif
+		if constexpr (UseAtomics) {
+			atomicOr(&need_more_iter, 1);
+		} else {
+			need_more_iter = 1;
+		}
 	}
 }
 
+enum KernelType {
+	First,
+	RegPoints,
+	Shmem,
+	NoDeltas
+};
 
-unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int cols, float radius, float convergence_threshold, bool do_color) {
+template <KernelType WhichKernel, bool EarlyStop = true, size_t SH_PAD = 48, bool UseAtomics = true>
+unsigned char * GPU_driver(const unsigned char *image_data, int rows, int cols, float radius, float convergence_threshold, bool do_color) {
 	unsigned char *result = (unsigned char*)malloc(rows * cols * 3);
 	int* cluster_ids = (int*)malloc(rows * cols * sizeof(int));
 	cudaError_t err_code = cudaSuccess;
@@ -690,28 +777,22 @@ unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int
 	err_code = cudaMalloc((void**)&dev_centroids, rows * cols * sizeof(Point));
 	err_code = cudaMemcpy(dev_centroids, host_centroids, rows * cols * sizeof(Point), cudaMemcpyHostToDevice);
 	
-	float *host_deltas = (float*)malloc(rows * cols * sizeof(float));
-	for (int i = 0; i < rows * cols; i++) {
-		host_deltas[i] = INFINITY;
+	float *host_deltas = NULL, *dev_deltas = NULL;
+	if constexpr (WhichKernel != NoDeltas) {
+		host_deltas = (float*)malloc(rows * cols * sizeof(float));
+		for (int i = 0; i < rows * cols; i++) {
+			host_deltas[i] = INFINITY;
+		}
+		dev_deltas = NULL;
+		err_code = cudaMalloc((void**)&dev_deltas, rows * cols * sizeof(float));
+		err_code = cudaMemcpy(dev_deltas, host_deltas, rows * cols * sizeof(float), cudaMemcpyHostToDevice);
 	}
-	float *dev_deltas = NULL;
-	err_code = cudaMalloc((void**)&dev_deltas, rows * cols * sizeof(float));
-	err_code = cudaMemcpy(dev_deltas, host_deltas, rows * cols * sizeof(float), cudaMemcpyHostToDevice);
+	
 	
 	unsigned char *dev_image = NULL;
 	err_code = cudaMalloc((void**)&dev_image, rows * cols * 3);
 	err_code = cudaMemcpy(dev_image, image_data, rows * cols * 3, cudaMemcpyHostToDevice);
 	
-#ifdef COMPARE_GPU_AGAINST_SEQ
-	Point* seq_centroids = (Point*)malloc(rows * cols * sizeof(Point));
-	float* seq_deltas = (float*)malloc(rows * cols * sizeof(Point));
-	{
-		for (int i = 0; i < rows * cols; i++) {
-			seq_deltas[i] = INFINITY;
-		}
-		memcpy(seq_centroids, host_centroids, rows * cols * sizeof(Point));
-	}
-#endif
 #ifdef TIME_ITERS
 	std::chrono::time_point<std::chrono::high_resolution_clock> start, end;
 #endif
@@ -723,74 +804,57 @@ unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int
 		//My device (NVIDIA GeForce GTX 1660) has a max of 1024 threads per block
 		dim3 block_dims(32, 32);
 		dim3 grid_dims((cols + 31)/32, (rows + 31)/32);
-		naive_kernel<<<grid_dims, block_dims>>>(dev_image, rows, cols, radius, dev_centroids, dev_deltas, convergence_threshold);
+		if constexpr (WhichKernel == First) {
+			first_kernel<EarlyStop><<<grid_dims, block_dims>>>(dev_image, rows, cols, radius, dev_centroids, dev_deltas, convergence_threshold);
+		} else if constexpr (WhichKernel == RegPoints) {
+			reg_points_kernel<<<grid_dims, block_dims>>>(dev_image, rows, cols, radius, dev_centroids, dev_deltas, convergence_threshold);
+		} else if constexpr (WhichKernel == Shmem) {
+			shmem_kernel<SH_PAD><<<grid_dims, block_dims>>>(dev_image, rows, cols, radius, dev_centroids, dev_deltas, convergence_threshold);
+		} else if constexpr (WhichKernel == NoDeltas) {
+			int zero = 0;
+			err_code = cudaMemcpyToSymbol(need_more_iter, &zero, sizeof(int), 0, cudaMemcpyHostToDevice);
+			kernel_without_deltas<UseAtomics><<<grid_dims, block_dims>>>(dev_image, rows, cols, radius, dev_centroids, convergence_threshold);
+		} else {
+			fprintf(stderr, "Invalid Kernel specified\n");
+			abort();
+		}
 		
 #ifdef _DEBUG
 		err_code = cudaGetLastError(); //errors from launching the kernel
 		err_code = cudaDeviceSynchronize(); //errors that happened during the kernel launch
 #endif
-		
-#ifdef COMPARE_GPU_AGAINST_SEQ
-		cudaMemcpy(host_centroids, dev_centroids, rows * cols * sizeof(Point), cudaMemcpyDeviceToHost);
-		cudaMemcpy(host_deltas, dev_deltas, rows * cols * sizeof(float), cudaMemcpyDeviceToHost);
-		for (int r = 0; r < rows; r++) {
-			for (int c = 0; c < cols; c++) {
-				naive_kernel_internals(image_data, rows, cols, r, c, radius, seq_centroids, seq_deltas, convergence_threshold);
-				/*if (memcmp(&host_centroids[r * cols + c], &seq_centroids[r * cols + c], sizeof(Point))) {
-					fprintf(stderr, "centroid for r=%d, c=%d does not match\n", r, c);
-				}*/
-				if (fabs(host_deltas[r * cols + c] - seq_deltas[r * cols + c]) > 0.1) {
-					Point host_centroid = host_centroids[r * cols + c],
-						seq_centroid = seq_centroids[r * cols + c];
-					fprintf(stderr, "iter %2d, delta for r=%4d, c=%4d does not match, seq = %f, dev = %f\nhost centroid = (%f,%f,%f,%f,%f), seq centroid = (%f,%f,%f,%f,%f)\n",
-						iters, r, c, seq_deltas[r * cols + c], host_deltas[r * cols + c],
-						host_centroid.r, host_centroid.g, host_centroid.b, host_centroid.row, host_centroid.col,
-						seq_centroid.r, seq_centroid.g, seq_centroid.b, seq_centroid.row, seq_centroid.col);
+		if constexpr (WhichKernel != NoDeltas) {
+			int blocks_necessary = (int)ceil((float)(rows * cols) / 2048.0f); //1024 is max threads per block on my device
+			max_in_groups<<<blocks_necessary, 1024>>>(dev_deltas, rows * cols);
+#ifdef _DEBUG
+			err_code = cudaGetLastError();
+			err_code = cudaDeviceSynchronize();
+#endif
+			bool all_below_threshold = true;
+			//Maybe it would be faster to make one big array here and just do one memcpy into that
+			for (int i = 0; i < rows * cols; i += 2048) {
+				float temp;
+				cudaMemcpy(&temp, &dev_deltas[i], sizeof(float), cudaMemcpyDeviceToHost);
+				if (temp > convergence_threshold) {
+					all_below_threshold = false;
+					break;
 				}
 			}
-		}
+#ifdef TIME_ITERS
+			end = std::chrono::high_resolution_clock::now();
+			printf("iter %d took %5ld ms\n", iters, std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
 #endif
-
-		//Faster code to check for convergence
-		//change this to do diagnostics on whole-warp convergence
-#ifdef USE_REDUCTION_KERNEL
-		int blocks_necessary = (int)ceil((float)(rows * cols) / 2048.0f); //1024 is max threads per block on my device
-		max_in_groups<<<blocks_necessary, 1024>>>(dev_deltas, rows * cols);
-#ifdef _DEBUG
-		err_code = cudaGetLastError();
-		err_code = cudaDeviceSynchronize();
-#endif
-		bool all_below_threshold = true;
-		//Maybe it would be faster to make one big array here and just do one memcpy into that
-		for (int i = 0; i < rows * cols; i += 2048) {
-			float temp;
-			cudaMemcpy(&temp, &dev_deltas[i], sizeof(float), cudaMemcpyDeviceToHost);
-			if (temp > convergence_threshold) {
-				all_below_threshold = false;
+			if (all_below_threshold) {
 				break;
 			}
-		}
-#ifdef TIME_ITERS
-		end = std::chrono::high_resolution_clock::now();
-		printf("iter %d took %5ld ms\n", iters, std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
-#endif
-		if (all_below_threshold) {
-			break;
+		} else { //using a NoDeltas kernel, stopping condition is different
+			int should_continue_host = 1;
+			err_code = cudaMemcpyFromSymbol(&should_continue_host, need_more_iter, sizeof(int), 0, cudaMemcpyDeviceToHost);
+			if (!should_continue_host) {
+				break;
+			}
 		}
 		
-#else
-		err_code = cudaMemcpy(host_deltas, dev_deltas, rows * cols * sizeof(float), cudaMemcpyDeviceToHost);
-		bool all_below_threshold = true;
-		for (int i = 0; i < rows * cols; i++) {
-			if (host_deltas[i] > convergence_threshold) {
-				all_below_threshold = false;
-				break;
-			}
-		}
-		if (all_below_threshold) {
-			break;
-		}
-#endif
 	}
 	
 	err_code = cudaMemcpy(host_centroids, dev_centroids, rows * cols * sizeof(Point), cudaMemcpyDeviceToHost);
@@ -820,132 +884,14 @@ unsigned char * naive_GPU_version(const unsigned char *image_data, int rows, int
 	free(host_deltas);
 	cudaFree(dev_deltas);
 	cudaFree(dev_image);
-#ifdef COMPARE_GPU_AGAINST_SEQ
-	free(seq_centroids);
-	free(seq_deltas);
-#endif
+	(void)err_code;
 	return result;
 	
 }
 
-unsigned char* no_deltas_version(const unsigned char* image_data, int rows, int cols, float radius, float convergence_threshold, bool do_color) {
-	unsigned char* result = (unsigned char*)malloc(rows * cols * 3);
-	int* cluster_ids = (int*)malloc(rows * cols * sizeof(int));
-	cudaError_t err_code = cudaSuccess;
-	err_code = cudaSetDevice(0);
-	Point* host_centroids = (Point*)malloc(rows * cols * sizeof(Point));
-	for (int r = 0; r < rows; r++) {
-		for (int c = 0; c < cols; c++) {
-			const unsigned char* const base_of_pixel = &image_data[(r * cols + c) * 3];
-			host_centroids[r * cols + c] = Point(base_of_pixel[0], base_of_pixel[1], base_of_pixel[2], r, c);
-		}
-	}
-	Point* dev_centroids = NULL;
-	err_code = cudaMalloc((void**)&dev_centroids, rows * cols * sizeof(Point));
-	err_code = cudaMemcpy(dev_centroids, host_centroids, rows * cols * sizeof(Point), cudaMemcpyHostToDevice);
-
-	unsigned char* dev_image = NULL;
-	err_code = cudaMalloc((void**)&dev_image, rows * cols * 3);
-	err_code = cudaMemcpy(dev_image, image_data, rows * cols * 3, cudaMemcpyHostToDevice);
-
-#ifdef USE_TEX_MEM
-	cudaResourceViewDesc view_desc;
-	memset(&view_desc, 0, sizeof(view_desc));
-	view_desc.format = cudaResViewFormatUnsignedChar1;
-	view_desc.width = cols;
-	view_desc.height = rows;
-	view_desc.depth = 3;
-	cudaResourceDesc res_desc;
-	res_desc.resType = cudaResourceTypeLinear;
-	res_desc.res.linear.devPtr = dev_image; //I'm hoping cudaMalloc will align this correctly
-	res_desc.res.linear.sizeInBytes = rows * cols * 3;
-	res_desc.res.linear.desc = cudaCreateChannelDesc<unsigned char>();
-	cudaTextureDesc tex_desc;
-	memset(&tex_desc, 0, sizeof(tex_desc));
-	tex_desc.readMode = cudaReadModeNormalizedFloat;
-	tex_desc.sRGB = 0;
-	tex_desc.normalizedCoords = 1; //all coords need to be lerped to [0.0, 1.0 - 1/N]
-	tex_desc.disableTrilinearOptimization = 1; //Not sure what this is, but probably don't want it
-	cudaTextureObject_t tex;
-	err_code = cudaCreateTextureObject(&tex, &res_desc, &tex_desc, &view_desc);
-#endif
-
-#ifdef TIME_ITERS
-	std::chrono::time_point<std::chrono::high_resolution_clock> start, end;
-#endif
-	for (int iters = 0; ; iters++) {
-#ifdef TIME_ITERS
-		start = std::chrono::high_resolution_clock::now();
-#endif
-		dim3 block_dims(32, 32);
-		dim3 grid_dims((cols + 31) / 32, (rows + 31) / 32);
-		int should_continue_host = 0;
-		err_code = cudaMemcpyToSymbol(need_more_iter, &should_continue_host, sizeof(int), 0, cudaMemcpyHostToDevice);
-		kernel_without_deltas << <grid_dims, block_dims >> > (dev_image, rows, cols, radius, dev_centroids, convergence_threshold
-#ifdef USE_TEX_MEM
-			, tex
-#endif
-			);
-#ifdef _DEBUG
-		err_code = cudaGetLastError();
-		err_code = cudaDeviceSynchronize();
-#endif
-		err_code = cudaMemcpyFromSymbol(&should_continue_host, need_more_iter, sizeof(int), 0, cudaMemcpyDeviceToHost);
-#ifdef TIME_ITERS
-		end = std::chrono::high_resolution_clock::now();
-		printf("iter %d took %5ld ms\n", iters, std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
-#endif
-		if (!should_continue_host) {
-			break;
-		}
-		/*printf("press enter to do next iter...");
-		getchar();*/
-	}
-
-#ifdef USE_TEX_MEM
-	cudaDestroyTextureObject(tex);
-#endif
-	
-	err_code = cudaMemcpy(host_centroids, dev_centroids, rows * cols * sizeof(Point), cudaMemcpyDeviceToHost);
-	for (int i = 0; i < rows * cols; i++) {
-#ifdef _DEBUG
-		if (host_centroids[i].r >= 0) {
-			fprintf(stderr, "host_centroid[%d].r = %f\n", i, host_centroids[i].r);
-		}
-#endif
-		host_centroids[i].r += 256;
-	}
-
-	std::vector<Point> cluster_convergences;
-	cluster_convergences.reserve(256);
-	for (int r = 0; r < rows; r++) {
-		for (int c = 0; c < cols; c++) {
-			int cluster_id = -1;
-			for (int i = 0; i < cluster_convergences.size(); i++) {
-				if (cluster_convergences[i].distance_squared(&host_centroids[r * cols + c]) <= 4 * convergence_threshold * convergence_threshold) {
-					cluster_id = i;
-					break;
-				}
-			}
-			if (cluster_id == -1) {
-				cluster_convergences.push_back(host_centroids[r * cols + c]);
-				cluster_id = cluster_convergences.size() - 1;
-			}
-			cluster_ids[r * cols + c] = cluster_id;
-		}
-	}
-	if (do_color) color_result(image_data, result, cluster_ids, cluster_convergences.size(), rows, cols);
-
-	free(host_centroids);
-	cudaFree(dev_centroids);
-	cudaFree(dev_image);
-
-	return result;
-}
-
-void timings(const char* filename) {
+void timings(const char* filename, float radius, float convergence_threshold) {
 	cudaFree(0); //Force init CUDA runtime
-	std::cout << "Now timing on " << filename << std::endl;
+	printf("Now timing on %s with radius %f and threshold %f\n", filename, radius, convergence_threshold);
 	int rows, cols, channels;
 	unsigned char* image_data = (unsigned char*)stbi_load(filename, &cols, &rows, &channels, 3);
 	if (!image_data) {
@@ -954,64 +900,60 @@ void timings(const char* filename) {
 	}
 
 	std::chrono::time_point < std::chrono::high_resolution_clock > start, end;
-
-	/*start = std::chrono::high_resolution_clock::now();
-	cpu_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, false);
-	end = std::chrono::high_resolution_clock::now();
-	printf("naive CPU: %10lldms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());*/
-
-	/*start = std::chrono::high_resolution_clock::now();
-	cpu_version_with_trajectories(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, false);
-	end = std::chrono::high_resolution_clock::now();
-	printf("CPU w/trj: %10lldms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());*/
-
-	//start = std::chrono::high_resolution_clock::now();
-	//sequential_gpu_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, false);
-	//end = std::chrono::high_resolution_clock::now();
-	//printf("seq GPU  : %10lldms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
-
-	start = std::chrono::high_resolution_clock::now();
-	naive_GPU_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, false);
-	end = std::chrono::high_resolution_clock::now();
-	printf("naive GPU: %10lldms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
-
-	start = std::chrono::high_resolution_clock::now();
-	no_deltas_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, false);
-	end = std::chrono::high_resolution_clock::now();
-	printf("no deltas: %10lldms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
+#define TIME(name, stmt) do { \
+	start = std::chrono::high_resolution_clock::now(); \
+	stmt; \
+	end = std::chrono::high_resolution_clock::now(); \
+	printf(name ": %10lldms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count()); \
+} while (0)
+	
+	//TIME("naive CPU            ", cpu_version(image_data, rows, cols, radius, convergence_threshold, false));
+	//TIME("CPU with trajectories", cpu_version_with_trajectories(image_data, rows, cols, radius, convergence_threshold, false));
+	//TIME("first kernel         ", (GPU_driver<First, false, 0, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("with early stop      ", (GPU_driver<First, true, 0, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	TIME("points in regs       ", GPU_driver<RegPoints>(image_data, rows, cols, radius, convergence_threshold, false));
+	TIME("Shmem, pad=48        ", (GPU_driver<Shmem, false, 48, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("Shmem, pad=32        ", (GPU_driver<Shmem, false, 32, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("Shmem, pad=16        ", (GPU_driver<Shmem, false, 16, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("Shmem, pad=8         ", (GPU_driver<Shmem, false, 8, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	TIME("no deltas            ", (GPU_driver<NoDeltas, false, 0, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	TIME("no deltas, no atomics", GPU_driver<NoDeltas>(image_data, rows, cols, radius, convergence_threshold, false));
 }
 int main()
 {
-	//timings("test_images/dapper_lad_smaller.jpg");
-	//timings("test_images/dapper_lad.jpg");
-	timings("test_images/campus.jpg");
+	//timings("test_images/dapper_lad_smaller.jpg", 50, 10);
+	//timings("test_images/dapper_lad.jpg", 50, 10);
+	timings("test_images/campus.jpg", 10, 10);
+	timings("test_images/campus.jpg", 50, 10);
+	timings("test_images/campus.jpg", 100, 10);
+	
+	//timings("test_images/eas_1500x100.jpg", 50, 50);
 	return;
 
     int rows, cols, channels;
-    unsigned char* image_data = (unsigned char*)stbi_load("test_images/campus.jpg", &cols, &rows, &channels, 3);
+    unsigned char* image_data = (unsigned char*)stbi_load("test_images/dapper_lad_smaller.jpg", &cols, &rows, &channels, 3);
     if (!image_data) {
         fprintf(stderr, "Error reading image: %s\n", stbi_failure_reason());
         return -1;
     }
-    /*unsigned char * cpu_result = cpu_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, true);
-    stbi_write_png("cpu_output.png", cols, rows, 3, cpu_result, 0);
-    free(cpu_result);*/
+#define WRITE_IMG(filename, stmt) do { \
+	unsigned char * result = stmt; \
+	stbi_write_png(filename, cols, rows, 3, result, 0); \
+	free(result); \
+} while (0)
+	const float radius = 50, convergence_threshold = 10;
+	WRITE_IMG("cpu_output.png", cpu_version(image_data, rows, cols, radius, convergence_threshold, true));
+	WRITE_IMG("cpu_traj_output.png", cpu_version_with_trajectories(image_data, rows, cols, radius, convergence_threshold, true));
 
-	/*unsigned char* cpu_traj_result = cpu_version_with_trajectories(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, true);
-	stbi_write_png("cpu_output_traj.png", cols, rows, 3, cpu_traj_result, 0);
-	free(cpu_traj_result);*/
-
-	/*unsigned char* sequential_kernel_result = sequential_gpu_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, true);
-	stbi_write_png("sequential_output.png", cols, rows, 3, sequential_kernel_result, 0);
-	free(sequential_kernel_result);*/
-
-	/*unsigned char * gpu_result = naive_GPU_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, true);
-	stbi_write_png("gpu_output.png", cols, rows, 3, gpu_result, 0);
-	free(gpu_result);*/
-
-	unsigned char* no_delta_result = no_deltas_version(image_data, rows, cols, SEARCH_RADIUS, CONVERGENCE_THRESHOLD, true);
-	stbi_write_png("no_delta_output.png", cols, rows, 3, no_delta_result, 0);
-	free(no_delta_result);
+	WRITE_IMG("first_kernel_output.png", (GPU_driver<First, false, 0, false>(image_data, rows, cols, radius, convergence_threshold, true)));
+	WRITE_IMG("early_stop_output.png", (GPU_driver<First, true, 0, false>(image_data, rows, cols, radius, convergence_threshold, true)));
+	WRITE_IMG("reg_points_output.png", GPU_driver<RegPoints>(image_data, rows, cols, radius, convergence_threshold, true));
+	WRITE_IMG("shmem_pad_48_output.png", (GPU_driver<Shmem, false, 48, false>(image_data, rows, cols, radius, convergence_threshold, true)));
+	WRITE_IMG("Shmem_pad_32_output.png", (GPU_driver<Shmem, false, 32, false>(image_data, rows, cols, radius, convergence_threshold, true)));
+	WRITE_IMG("Shmem_pad_16_output.png", (GPU_driver<Shmem, false, 16, false>(image_data, rows, cols, radius, convergence_threshold, true)));
+	WRITE_IMG("Shmem_pad_8_output.png", (GPU_driver<Shmem, false, 8, false>(image_data, rows, cols, radius, convergence_threshold, true)));
+	WRITE_IMG("no_deltas_output.png", (GPU_driver<NoDeltas, false, 0, false>(image_data, rows, cols, radius, convergence_threshold, true)));
+	WRITE_IMG("no_atomics_output.png", GPU_driver<NoDeltas>(image_data, rows, cols, radius, convergence_threshold, true));
 	
 	stbi_image_free(image_data);
 

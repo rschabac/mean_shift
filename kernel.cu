@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <chrono>
 #include <vector>
+#include <omp.h>
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_FAILURE_USERMSG
@@ -108,7 +109,7 @@ unsigned char * cpu_version(const unsigned char* image_data, int rows, int cols,
 				}
 				float delta_squared = new_centroid.distance_squared(&centroid);
 				centroid = new_centroid;
-				if (delta_squared <= convergence_threshold * convergence_threshold) {
+				if (delta_squared <= convergence_threshold) {
 					break;
 				}
 			}
@@ -137,6 +138,76 @@ unsigned char * cpu_version(const unsigned char* image_data, int rows, int cols,
 	
 	//now compute average rgb for each cluster
 	if (do_color) {
+		color_result(image_data, result, cluster_ids, cluster_convergences.size(), rows, cols);
+	}
+	free(cluster_ids);
+	return result;
+}
+
+template <bool Traj = false>
+unsigned char* cpu_version_omp(const unsigned char* image_data, int rows, int cols, float radius, float convergence_threshold, bool do_color) {
+	static_assert(!Traj, "trajectories in OMP not supported yet");
+	int* cluster_ids = (int*)malloc(rows * cols * sizeof(int));
+	
+	const float radius_squared = radius * radius;
+	std::vector<Point> cluster_convergences;
+	cluster_convergences.reserve(256);
+	#pragma omp parallel for collapse(2) schedule(dynamic)
+	for (int r = 0; r < rows; r++) {
+		for (int c = 0; c < cols; c++) {
+			const unsigned char* const base_of_start_pixel = &image_data[(r * cols + c) * 3];
+			Point centroid(base_of_start_pixel[0], base_of_start_pixel[1], base_of_start_pixel[2], r, c);
+			while (true) {
+				Point new_centroid(0, 0, 0, 0, 0);
+				int num_neighbors = 0;
+				for (int d_r = (int)floorf(-radius) - 1; d_r <= (int)ceilf(radius) + 1; d_r++) {
+					float limit = sqrtf(radius * radius - d_r * d_r);
+					for (int d_c = floorf(-limit); d_c <= ceilf(limit); d_c++) {
+						if (d_r * d_r + d_c * d_c > radius_squared) continue;
+						int search_r = (int)floorf(centroid.row + d_r), search_c = (int)floorf(centroid.col + d_c);
+						if (search_r < 0 || search_r >= rows || search_c < 0 || search_c >= cols) continue;
+						
+						const unsigned char * const base_of_pixel = &image_data[(search_r * cols + search_c) * 3];
+						Point potential_neighbor(base_of_pixel[0], base_of_pixel[1], base_of_pixel[2], search_r, search_c);
+						float distance_squared = potential_neighbor.distance_squared(&centroid);
+						if (distance_squared <= radius_squared) {
+							num_neighbors++;
+							for (int i = 0; i < 5; i++) {
+								*new_centroid[i] += *potential_neighbor[i];
+							}
+						}
+					}
+				}
+				for (int i = 0; i < 5; i++) {
+					*new_centroid[i] /= num_neighbors;
+				}
+				float delta_squared = new_centroid.distance_squared(&centroid);
+				centroid = new_centroid;
+				if (delta_squared <= convergence_threshold) {
+					break;
+				}
+			}
+			int cluster_id = -1;
+			#pragma omp critical
+			{
+				for (int i = 0; i < cluster_convergences.size(); i++) {
+					if (cluster_convergences[i].distance_squared(&centroid) <= 4 * convergence_threshold * convergence_threshold) {
+						cluster_id = i;
+						break;
+					}
+				}
+				if (cluster_id == -1) {
+					cluster_convergences.push_back(centroid);
+					cluster_id = cluster_convergences.size() - 1;
+				}
+			}
+			cluster_ids[r * cols + c] = cluster_id;
+		}
+	}
+	
+	unsigned char *result = nullptr;
+	if (do_color) {
+		result = (unsigned char*)malloc(rows * cols * 3);
 		color_result(image_data, result, cluster_ids, cluster_convergences.size(), rows, cols);
 	}
 	free(cluster_ids);
@@ -201,7 +272,7 @@ unsigned char *cpu_version_with_trajectories(const unsigned char *image_data, in
 				this_trajectory.push_back(new_centroid);
 				float delta_squared = new_centroid.distance_squared(&centroid);
 				centroid = new_centroid;
-				if (delta_squared <= convergence_threshold * convergence_threshold) {
+				if (delta_squared <= convergence_threshold) {
 					break;
 				}
 			}
@@ -268,12 +339,8 @@ void color_result(const unsigned char *image_data, unsigned char *result, int *c
 	}
 }
 
-void naive_kernel_internals(const unsigned char* RESTRICT image, int rows, int cols, int r, int c, float radius, Point* centroids, float* deltas, float convergence_threshold) {
+void naive_kernel_internals(const unsigned char* image, int rows, int cols, int r, int c, float radius, Point* centroids, bool *need_more_iter, float convergence_threshold) {
 	if (r >= rows || c >= cols) {
-		return;
-	}
-	if (deltas[r * cols + c] <= convergence_threshold) {
-		//No need to keep iterating this centroid
 		return;
 	}
 	Point new_centroid(0, 0, 0, 0, 0);
@@ -281,9 +348,8 @@ void naive_kernel_internals(const unsigned char* RESTRICT image, int rows, int c
 	Point* this_centroid = &centroids[r * cols + c];
 	const float radius_squared = radius * radius;
 	for (int d_r = (int)floorf(-radius) - 1; d_r <= (int)ceilf(radius) + 1; d_r++) {
-		//float limit = sqrtf(radius * radius - d_r * d_r);
-		//for (int d_c = floorf(-limit); d_c <= ceilf(limit); d_c++) {
-		for (int d_c = (int)floorf(-radius) - 1; d_c <= (int)ceilf(radius) + 1; d_c++) {
+		float limit = sqrtf(radius * radius - d_r * d_r);
+		for (int d_c = floorf(-limit); d_c <= ceilf(limit); d_c++) {
 			if (d_r * d_r + d_c * d_c > radius_squared) continue;
 			int search_r = (int)floorf(this_centroid->row + d_r), search_c = (int)floorf(this_centroid->col + d_c);
 			if (search_r < 0 || search_r >= rows || search_c < 0 || search_c >= cols) {
@@ -306,10 +372,9 @@ void naive_kernel_internals(const unsigned char* RESTRICT image, int rows, int c
 	}
 	float distance_squared = new_centroid.distance_squared(this_centroid);
 	*this_centroid = new_centroid;
-	/*if (deltas[r * cols + c] > distance_squared) {
-		fprintf(stderr, "delta for r=%d, c=%d got bigger, was %f, now is %f\n", r, c, deltas[r * cols + c], distance_squared);
-	}*/
-	deltas[r * cols + c] = distance_squared;
+	if (distance_squared > convergence_threshold) {
+		*need_more_iter = true;
+	}
 }
 
 template <bool EarlyStop>
@@ -551,35 +616,16 @@ unsigned char* sequential_gpu_version(const unsigned char* image_data, int rows,
 		}
 	}
 	
-	float *deltas = (float*)malloc(rows * cols * sizeof(float));
-	for (int r = 0; r < rows; r++) {
-		for (int c = 0; c < cols; c++) {
-			deltas[r * cols + c] = INFINITY;
-		}
-	}
-	
-	//int iters = 0;
-	while (true) {
+	int iters = 0;
+	for (; ; iters++) {
+		bool need_more_iter = false;
+		//#pragma omp parallel for
 		for (int r = 0; r < rows; r++) {
 			for (int c = 0; c < cols; c++) {
-				naive_kernel_internals(image_data, rows, cols, r, c, radius, centroids, deltas, convergence_threshold);
+				naive_kernel_internals(image_data, rows, cols, r, c, radius, centroids, &need_more_iter, convergence_threshold);
 			}
 		}
-		bool found_greater_than_thresh = false;
-		for (int r = 0; r < rows; r++) {
-			for (int c = 0; c < cols; c++) {
-				if (deltas[r * cols + c] > convergence_threshold) {
-					found_greater_than_thresh = true;
-					break;
-				}
-			}
-			if (found_greater_than_thresh) {
-				break;
-			}
-		}
-		if (!found_greater_than_thresh) {
-			break;
-		}
+		if (!need_more_iter) break;
 	}
 	
 	std::vector<Point> cluster_convergences;
@@ -603,7 +649,6 @@ unsigned char* sequential_gpu_version(const unsigned char* image_data, int rows,
 	if (do_color) color_result(image_data, result, cluster_ids, cluster_convergences.size(), rows, cols);
 	
 	free(cluster_ids);
-	free(deltas);
 	free(centroids);
 	return result;
 }
@@ -909,29 +954,27 @@ void timings(const char* filename, float radius, float convergence_threshold) {
 	
 	//TIME("naive CPU            ", cpu_version(image_data, rows, cols, radius, convergence_threshold, false));
 	//TIME("CPU with trajectories", cpu_version_with_trajectories(image_data, rows, cols, radius, convergence_threshold, false));
+	TIME("cylinder test, OMP   ", cpu_version_omp(image_data, rows, cols, radius, convergence_threshold, false));
 	//TIME("first kernel         ", (GPU_driver<First, false, 0, false>(image_data, rows, cols, radius, convergence_threshold, false)));
 	//TIME("with early stop      ", (GPU_driver<First, true, 0, false>(image_data, rows, cols, radius, convergence_threshold, false)));
-	TIME("points in regs       ", GPU_driver<RegPoints>(image_data, rows, cols, radius, convergence_threshold, false));
-	TIME("Shmem, pad=48        ", (GPU_driver<Shmem, false, 48, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("points in regs       ", GPU_driver<RegPoints>(image_data, rows, cols, radius, convergence_threshold, false));
+	//TIME("Shmem, pad=48        ", (GPU_driver<Shmem, false, 48, false>(image_data, rows, cols, radius, convergence_threshold, false)));
 	//TIME("Shmem, pad=32        ", (GPU_driver<Shmem, false, 32, false>(image_data, rows, cols, radius, convergence_threshold, false)));
 	//TIME("Shmem, pad=16        ", (GPU_driver<Shmem, false, 16, false>(image_data, rows, cols, radius, convergence_threshold, false)));
 	//TIME("Shmem, pad=8         ", (GPU_driver<Shmem, false, 8, false>(image_data, rows, cols, radius, convergence_threshold, false)));
-	TIME("no deltas            ", (GPU_driver<NoDeltas, false, 0, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("no deltas            ", (GPU_driver<NoDeltas, false, 0, false>(image_data, rows, cols, radius, convergence_threshold, false)));
 	TIME("no deltas, no atomics", GPU_driver<NoDeltas>(image_data, rows, cols, radius, convergence_threshold, false));
 }
 int main()
 {
-	//timings("test_images/dapper_lad_smaller.jpg", 50, 10);
 	//timings("test_images/dapper_lad.jpg", 50, 10);
-	timings("test_images/campus.jpg", 10, 10);
-	timings("test_images/campus.jpg", 50, 10);
-	timings("test_images/campus.jpg", 100, 10);
-	
-	//timings("test_images/eas_1500x100.jpg", 50, 50);
-	return;
+	//timings("test_images/campus.jpg", 40, 5);
+	//timings("test_images/fruit_1000x562.jpg", 65, 3);
+	//timings("test_images/eas_1500x1000.jpg", 60, 10);
+	//return;
 
     int rows, cols, channels;
-    unsigned char* image_data = (unsigned char*)stbi_load("test_images/dapper_lad_smaller.jpg", &cols, &rows, &channels, 3);
+    unsigned char* image_data = (unsigned char*)stbi_load("test_images/dapper_lad.jpg", &cols, &rows, &channels, 3);
     if (!image_data) {
         fprintf(stderr, "Error reading image: %s\n", stbi_failure_reason());
         return -1;
@@ -942,7 +985,11 @@ int main()
 	free(result); \
 } while (0)
 	const float radius = 50, convergence_threshold = 10;
-	WRITE_IMG("cpu_output.png", cpu_version(image_data, rows, cols, radius, convergence_threshold, true));
+	
+	WRITE_IMG("gpu_output.png", GPU_driver<NoDeltas>(image_data, rows, cols, 50, 10, true));
+	WRITE_IMG("omp_output.png", cpu_version(image_data, rows, cols, 50, 10, true));
+	
+	/*WRITE_IMG("cpu_output.png", cpu_version(image_data, rows, cols, radius, convergence_threshold, true));
 	WRITE_IMG("cpu_traj_output.png", cpu_version_with_trajectories(image_data, rows, cols, radius, convergence_threshold, true));
 
 	WRITE_IMG("first_kernel_output.png", (GPU_driver<First, false, 0, false>(image_data, rows, cols, radius, convergence_threshold, true)));
@@ -953,7 +1000,20 @@ int main()
 	WRITE_IMG("Shmem_pad_16_output.png", (GPU_driver<Shmem, false, 16, false>(image_data, rows, cols, radius, convergence_threshold, true)));
 	WRITE_IMG("Shmem_pad_8_output.png", (GPU_driver<Shmem, false, 8, false>(image_data, rows, cols, radius, convergence_threshold, true)));
 	WRITE_IMG("no_deltas_output.png", (GPU_driver<NoDeltas, false, 0, false>(image_data, rows, cols, radius, convergence_threshold, true)));
-	WRITE_IMG("no_atomics_output.png", GPU_driver<NoDeltas>(image_data, rows, cols, radius, convergence_threshold, true));
+	WRITE_IMG("no_atomics_output.png", GPU_driver<NoDeltas>(image_data, rows, cols, radius, convergence_threshold, true));*/
+	
+	//WRITE_IMG("radius_60_threshold_10.png", GPU_driver<NoDeltas>(image_data, rows, cols, 60, 10, true));
+	//WRITE_IMG("radius_70_threshold_10.png", GPU_driver<NoDeltas>(image_data, rows, cols, 70, 10, true));
+	//WRITE_IMG("radius_80_threshold_10.png", GPU_driver<NoDeltas>(image_data, rows, cols, 80, 10, true));
+	//WRITE_IMG("radius_90_threshold_10.png", GPU_driver<NoDeltas>(image_data, rows, cols, 90, 10, true));
+
+	//WRITE_IMG("radius_60_threshold_1.png", GPU_driver<NoDeltas>(image_data, rows, cols, 60, 1, true));
+	//WRITE_IMG("radius_60_threshold_5.png", GPU_driver<NoDeltas>(image_data, rows, cols, 60, 5, true));
+	//WRITE_IMG("radius_60_threshold_10.png", GPU_driver<NoDeltas>(image_data, rows, cols, 60, 10, true));
+	//WRITE_IMG("radius_60_threshold_50.png", GPU_driver<NoDeltas>(image_data, rows, cols, 60, 50, true));
+	//WRITE_IMG("radius_60_threshold_100.png", GPU_driver<NoDeltas>(image_data, rows, cols, 60, 100, true));
+
+	//WRITE_IMG("omp.png", cpu_version_omp(image_data, rows, cols, 50, 10, true));
 	
 	stbi_image_free(image_data);
 

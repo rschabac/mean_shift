@@ -1188,21 +1188,21 @@ void timings(const char* filename, float radius, float convergence_threshold, in
 	printf("\n"); \
 } while (0)
 	
-	if (do_cpu_tests) {
+	/*if (do_cpu_tests) {
 		TIME("naive CPU            ", cpu_version(image_data, rows, cols, radius, convergence_threshold, false));
 		TIME("CPU with trajectories", cpu_version_with_trajectories(image_data, rows, cols, radius, convergence_threshold, false));
 		TIME("cylinder test, OMP   ", cpu_version_omp(image_data, rows, cols, radius, convergence_threshold, false));
-	}
-	TIME("first kernel         ", (GPU_driver<First, false, 0, false>(image_data, rows, cols, radius, convergence_threshold, false)));
-	TIME("with early stop      ", (GPU_driver<First, true, 0, false>(image_data, rows, cols, radius, convergence_threshold, false)));
-	TIME("points in regs       ", GPU_driver<RegPoints>(image_data, rows, cols, radius, convergence_threshold, false));
-	TIME("Shmem, pad=48        ", (GPU_driver<Shmem, false, 48, false>(image_data, rows, cols, radius, convergence_threshold, false)));
-	TIME("Shmem, pad=32        ", (GPU_driver<Shmem, false, 32, false>(image_data, rows, cols, radius, convergence_threshold, false)));
-	TIME("Shmem, pad=16        ", (GPU_driver<Shmem, false, 16, false>(image_data, rows, cols, radius, convergence_threshold, false)));
-	TIME("Shmem, pad=8         ", (GPU_driver<Shmem, false, 8, false>(image_data, rows, cols, radius, convergence_threshold, false)));
-	TIME("no deltas            ", (GPU_driver<NoDeltas, false, 0, false>(image_data, rows, cols, radius, convergence_threshold, false)));
-	TIME("no deltas, no atomics", GPU_driver<NoDeltas>(image_data, rows, cols, radius, convergence_threshold, false));
-	TIME("kernel loop, no shmem", GPU_driver<Loop>(image_data, rows, cols, radius, convergence_threshold, false));
+	}*/
+	//TIME("first kernel         ", (GPU_driver<First, false, 0, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("with early stop      ", (GPU_driver<First, true, 0, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("points in regs       ", GPU_driver<RegPoints>(image_data, rows, cols, radius, convergence_threshold, false));
+	//TIME("Shmem, pad=48        ", (GPU_driver<Shmem, false, 48, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("Shmem, pad=32        ", (GPU_driver<Shmem, false, 32, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("Shmem, pad=16        ", (GPU_driver<Shmem, false, 16, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("Shmem, pad=8         ", (GPU_driver<Shmem, false, 8, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("no deltas            ", (GPU_driver<NoDeltas, false, 0, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("no deltas, no atomics", GPU_driver<NoDeltas>(image_data, rows, cols, radius, convergence_threshold, false));
+	//TIME("kernel loop, no shmem", (GPU_driver<Loop, false, 0, false>(image_data, rows, cols, radius, convergence_threshold, false)));
 	TIME("kernel loop, shmem=48", (GPU_driver<Loop, false, 48, false>(image_data, rows, cols, radius, convergence_threshold, false)));
 	TIME("kernel loop, shmem=32", (GPU_driver<Loop, false, 32, false>(image_data, rows, cols, radius, convergence_threshold, false)));
 	TIME("kernel loop, shmem=16", (GPU_driver<Loop, false, 16, false>(image_data, rows, cols, radius, convergence_threshold, false)));
@@ -1211,9 +1211,9 @@ void timings(const char* filename, float radius, float convergence_threshold, in
 int main()
 {
 	//timings("test_images/dapper_lad_smaller.jpg", 50, 10, 10, true);
-	timings("test_images/dapper_lad.jpg", 50, 5, 10, true);
-	timings("test_images/campus.jpg", 40, 5, 10, true);
-	timings("test_images/fruit_1000x562.jpg", 65, 3, 10, false);
+	//timings("test_images/dapper_lad.jpg", 50, 5, 10, true);
+	//timings("test_images/campus.jpg", 40, 5, 10, true);
+	//timings("test_images/fruit_1000x562.jpg", 65, 3, 10, false);
 	timings("test_images/eas_1500x1000.jpg", 60, 10, 10, false);
 	return;
 

@@ -109,7 +109,7 @@ unsigned char * cpu_version(const unsigned char* image_data, int rows, int cols,
 				}
 				float delta_squared = new_centroid.distance_squared(&centroid);
 				centroid = new_centroid;
-				if (delta_squared <= convergence_threshold) {
+				if (delta_squared <= convergence_threshold * convergence_threshold) {
 					break;
 				}
 			}
@@ -144,12 +144,11 @@ unsigned char * cpu_version(const unsigned char* image_data, int rows, int cols,
 	return result;
 }
 
-template <bool Traj = false>
 unsigned char* cpu_version_omp(const unsigned char* image_data, int rows, int cols, float radius, float convergence_threshold, bool do_color) {
-	static_assert(!Traj, "trajectories in OMP not supported yet");
 	int* cluster_ids = (int*)malloc(rows * cols * sizeof(int));
 	
 	const float radius_squared = radius * radius;
+	const float threshold_squared = convergence_threshold * convergence_threshold;
 	std::vector<Point> cluster_convergences;
 	cluster_convergences.reserve(256);
 	#pragma omp parallel for collapse(2) schedule(dynamic)
@@ -183,7 +182,7 @@ unsigned char* cpu_version_omp(const unsigned char* image_data, int rows, int co
 				}
 				float delta_squared = new_centroid.distance_squared(&centroid);
 				centroid = new_centroid;
-				if (delta_squared <= convergence_threshold) {
+				if (delta_squared <= threshold_squared) {
 					break;
 				}
 			}
@@ -997,7 +996,7 @@ unsigned char* loop_driver(const unsigned char* image_data, int rows, int cols, 
 	dim3 block_dims(32, 32);
 	dim3 grid_dims((cols + 31) / 32, (rows + 31) / 32);
 	if constexpr (SH_PAD == 0) {
-		kernel_with_loop << <grid_dims, block_dims >> > (dev_image, rows, cols, radius, dev_centroids, convergence_threshold);
+		kernel_with_loop << <grid_dims, block_dims >> > (dev_image, rows, cols, radius, dev_centroids, convergence_threshold * convergence_threshold);
 	} else {
 		kernel_with_loop_and_shmem<SH_PAD> << <grid_dims, block_dims >> > (dev_image, rows, cols, radius, dev_centroids, convergence_threshold);
 	}
@@ -1081,15 +1080,15 @@ unsigned char * GPU_driver(const unsigned char *image_data, int rows, int cols, 
 		dim3 block_dims(32, 32);
 		dim3 grid_dims((cols + 31)/32, (rows + 31)/32);
 		if constexpr (WhichKernel == First) {
-			first_kernel<EarlyStop><<<grid_dims, block_dims>>>(dev_image, rows, cols, radius, dev_centroids, dev_deltas, convergence_threshold);
+			first_kernel<EarlyStop><<<grid_dims, block_dims>>>(dev_image, rows, cols, radius, dev_centroids, dev_deltas, convergence_threshold * convergence_threshold);
 		} else if constexpr (WhichKernel == RegPoints) {
-			reg_points_kernel<<<grid_dims, block_dims>>>(dev_image, rows, cols, radius, dev_centroids, dev_deltas, convergence_threshold);
+			reg_points_kernel<<<grid_dims, block_dims>>>(dev_image, rows, cols, radius, dev_centroids, dev_deltas, convergence_threshold * convergence_threshold);
 		} else if constexpr (WhichKernel == Shmem) {
-			shmem_kernel<SH_PAD><<<grid_dims, block_dims>>>(dev_image, rows, cols, radius, dev_centroids, dev_deltas, convergence_threshold);
+			shmem_kernel<SH_PAD><<<grid_dims, block_dims>>>(dev_image, rows, cols, radius, dev_centroids, dev_deltas, convergence_threshold * convergence_threshold);
 		} else if constexpr (WhichKernel == NoDeltas) {
 			int zero = 0;
 			err_code = cudaMemcpyToSymbol(need_more_iter, &zero, sizeof(int), 0, cudaMemcpyHostToDevice);
-			kernel_without_deltas<UseAtomics><<<grid_dims, block_dims>>>(dev_image, rows, cols, radius, dev_centroids, convergence_threshold);
+			kernel_without_deltas<UseAtomics><<<grid_dims, block_dims>>>(dev_image, rows, cols, radius, dev_centroids, convergence_threshold * convergence_threshold);
 		} else {
 			fprintf(stderr, "Invalid Kernel specified\n");
 			abort();
@@ -1111,7 +1110,7 @@ unsigned char * GPU_driver(const unsigned char *image_data, int rows, int cols, 
 			for (int i = 0; i < rows * cols; i += 2048) {
 				float temp;
 				cudaMemcpy(&temp, &dev_deltas[i], sizeof(float), cudaMemcpyDeviceToHost);
-				if (temp > convergence_threshold) {
+				if (temp > convergence_threshold * convergence_threshold) {
 					all_below_threshold = false;
 					break;
 				}
@@ -1166,7 +1165,7 @@ unsigned char * GPU_driver(const unsigned char *image_data, int rows, int cols, 
 	
 }
 
-void timings(const char* filename, float radius, float convergence_threshold) {
+void timings(const char* filename, float radius, float convergence_threshold, int iters, bool do_cpu_tests) {
 	cudaFree(0); //Force init CUDA runtime
 	printf("Now timing on %s with radius %f and threshold %f\n", filename, radius, convergence_threshold);
 	int rows, cols, channels;
@@ -1178,23 +1177,30 @@ void timings(const char* filename, float radius, float convergence_threshold) {
 
 	std::chrono::time_point < std::chrono::high_resolution_clock > start, end;
 #define TIME(name, stmt) do { \
-	start = std::chrono::high_resolution_clock::now(); \
-	stmt; \
-	end = std::chrono::high_resolution_clock::now(); \
-	printf(name ": %10lldms\n", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count()); \
+	fprintf(stderr, "starting %s %s\n", filename, name); \
+	printf("%s: ", name); \
+	for (int i = 0; i < iters; i++) { \
+		start = std::chrono::high_resolution_clock::now(); \
+		stmt; \
+		end = std::chrono::high_resolution_clock::now(); \
+		printf("%lld, ", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count()); \
+	} \
+	printf("\n"); \
 } while (0)
 	
-	//TIME("naive CPU            ", cpu_version(image_data, rows, cols, radius, convergence_threshold, false));
-	//TIME("CPU with trajectories", cpu_version_with_trajectories(image_data, rows, cols, radius, convergence_threshold, false));
-	//TIME("cylinder test, OMP   ", cpu_version_omp(image_data, rows, cols, radius, convergence_threshold, false));
-	//TIME("first kernel         ", (GPU_driver<First, false, 0, false>(image_data, rows, cols, radius, convergence_threshold, false)));
-	//TIME("with early stop      ", (GPU_driver<First, true, 0, false>(image_data, rows, cols, radius, convergence_threshold, false)));
-	//TIME("points in regs       ", GPU_driver<RegPoints>(image_data, rows, cols, radius, convergence_threshold, false));
-	//TIME("Shmem, pad=48        ", (GPU_driver<Shmem, false, 48, false>(image_data, rows, cols, radius, convergence_threshold, false)));
-	//TIME("Shmem, pad=32        ", (GPU_driver<Shmem, false, 32, false>(image_data, rows, cols, radius, convergence_threshold, false)));
-	//TIME("Shmem, pad=16        ", (GPU_driver<Shmem, false, 16, false>(image_data, rows, cols, radius, convergence_threshold, false)));
-	//TIME("Shmem, pad=8         ", (GPU_driver<Shmem, false, 8, false>(image_data, rows, cols, radius, convergence_threshold, false)));
-	//TIME("no deltas            ", (GPU_driver<NoDeltas, false, 0, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	if (do_cpu_tests) {
+		TIME("naive CPU            ", cpu_version(image_data, rows, cols, radius, convergence_threshold, false));
+		TIME("CPU with trajectories", cpu_version_with_trajectories(image_data, rows, cols, radius, convergence_threshold, false));
+		TIME("cylinder test, OMP   ", cpu_version_omp(image_data, rows, cols, radius, convergence_threshold, false));
+	}
+	TIME("first kernel         ", (GPU_driver<First, false, 0, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	TIME("with early stop      ", (GPU_driver<First, true, 0, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	TIME("points in regs       ", GPU_driver<RegPoints>(image_data, rows, cols, radius, convergence_threshold, false));
+	TIME("Shmem, pad=48        ", (GPU_driver<Shmem, false, 48, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	TIME("Shmem, pad=32        ", (GPU_driver<Shmem, false, 32, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	TIME("Shmem, pad=16        ", (GPU_driver<Shmem, false, 16, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	TIME("Shmem, pad=8         ", (GPU_driver<Shmem, false, 8, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	TIME("no deltas            ", (GPU_driver<NoDeltas, false, 0, false>(image_data, rows, cols, radius, convergence_threshold, false)));
 	TIME("no deltas, no atomics", GPU_driver<NoDeltas>(image_data, rows, cols, radius, convergence_threshold, false));
 	TIME("kernel loop, no shmem", GPU_driver<Loop>(image_data, rows, cols, radius, convergence_threshold, false));
 	TIME("kernel loop, shmem=48", (GPU_driver<Loop, false, 48, false>(image_data, rows, cols, radius, convergence_threshold, false)));
@@ -1204,14 +1210,15 @@ void timings(const char* filename, float radius, float convergence_threshold) {
 }
 int main()
 {
-	timings("test_images/dapper_lad.jpg", 50, 10);
-	timings("test_images/campus.jpg", 40, 5);
-	timings("test_images/fruit_1000x562.jpg", 65, 3);
-	timings("test_images/eas_1500x1000.jpg", 60, 10);
+	//timings("test_images/dapper_lad_smaller.jpg", 50, 10, 10, true);
+	timings("test_images/dapper_lad.jpg", 50, 5, 10, true);
+	timings("test_images/campus.jpg", 40, 5, 10, true);
+	timings("test_images/fruit_1000x562.jpg", 65, 3, 10, false);
+	timings("test_images/eas_1500x1000.jpg", 60, 10, 10, false);
 	return;
 
     int rows, cols, channels;
-    unsigned char* image_data = (unsigned char*)stbi_load("test_images/dapper_lad.jpg", &cols, &rows, &channels, 3);
+    unsigned char* image_data = (unsigned char*)stbi_load("test_images/fruit_1000x562.jpg", &cols, &rows, &channels, 3);
     if (!image_data) {
         fprintf(stderr, "Error reading image: %s\n", stbi_failure_reason());
         return -1;
@@ -1223,12 +1230,8 @@ int main()
 } while (0)
 	const float radius = 50, convergence_threshold = 10;
 	
-	WRITE_IMG("gpu_output.png", GPU_driver<NoDeltas>(image_data, rows, cols, 50, 10, true));
-	WRITE_IMG("loop_output.png", GPU_driver<Loop>(image_data, rows, cols, 50, 10, true));
-	WRITE_IMG("shmem_48.png", (GPU_driver<Loop, false, 48, false>(image_data, rows, cols, 50, 10, true)));
-	WRITE_IMG("shmem_32.png", (GPU_driver<Loop, false, 32, false>(image_data, rows, cols, 50, 10, true)));
-	WRITE_IMG("shmem_16.png", (GPU_driver<Loop, false, 16, false>(image_data, rows, cols, 50, 10, true)));
-	WRITE_IMG("shmem_8.png", (GPU_driver<Loop, false, 8, false>(image_data, rows, cols, 50, 10, true)));
+	//WRITE_IMG("gpu_output.png", GPU_driver<NoDeltas>(image_data, rows, cols, 50, 10, true));
+	
 	
 	/*WRITE_IMG("cpu_output.png", cpu_version(image_data, rows, cols, radius, convergence_threshold, true));
 	WRITE_IMG("cpu_traj_output.png", cpu_version_with_trajectories(image_data, rows, cols, radius, convergence_threshold, true));
@@ -1243,10 +1246,7 @@ int main()
 	WRITE_IMG("no_deltas_output.png", (GPU_driver<NoDeltas, false, 0, false>(image_data, rows, cols, radius, convergence_threshold, true)));
 	WRITE_IMG("no_atomics_output.png", GPU_driver<NoDeltas>(image_data, rows, cols, radius, convergence_threshold, true));*/
 	
-	//WRITE_IMG("radius_60_threshold_10.png", GPU_driver<NoDeltas>(image_data, rows, cols, 60, 10, true));
-	//WRITE_IMG("radius_70_threshold_10.png", GPU_driver<NoDeltas>(image_data, rows, cols, 70, 10, true));
-	//WRITE_IMG("radius_80_threshold_10.png", GPU_driver<NoDeltas>(image_data, rows, cols, 80, 10, true));
-	//WRITE_IMG("radius_90_threshold_10.png", GPU_driver<NoDeltas>(image_data, rows, cols, 90, 10, true));
+	WRITE_IMG("fruit_65_3.png", GPU_driver<NoDeltas>(image_data, rows, cols, 65, 3, true));
 
 	//WRITE_IMG("radius_60_threshold_1.png", GPU_driver<NoDeltas>(image_data, rows, cols, 60, 1, true));
 	//WRITE_IMG("radius_60_threshold_5.png", GPU_driver<NoDeltas>(image_data, rows, cols, 60, 5, true));

@@ -971,6 +971,113 @@ __global__ void kernel_with_loop_and_shmem(const unsigned char* const RESTRICT i
 	}
 }
 
+template <size_t SH_PAD, bool SyncBeforeReturn>
+__global__ void kernel_with_loop_and_shmem_and_late_return(const unsigned char* const RESTRICT image, const int rows, const int cols, const float radius, Point* const centroids, const float convergence_threshold) {
+	const int c = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y * blockDim.y + threadIdx.y;
+
+	constexpr size_t SH_DIM = 32 + 2 * SH_PAD;
+	constexpr size_t RESP_DIM = (SH_DIM + 31) / 32;
+	__shared__ unsigned char shared[SH_DIM][SH_DIM][3];
+	for (int r_offset = 0; r_offset < RESP_DIM; r_offset++) {
+		for (int c_offset = 0; c_offset < RESP_DIM; c_offset++) {
+			const int image_r = 32 * blockIdx.y - SH_PAD + threadIdx.y * RESP_DIM + r_offset,
+				image_c = 32 * blockIdx.x - SH_PAD + threadIdx.x * RESP_DIM + c_offset;
+			if (image_r < 0 || image_r >= rows || image_c < 0 || image_c >= cols) {
+				continue;
+			}
+			const unsigned char* const base_of_pixel = &image[(image_r * cols + image_c) * 3];
+			int dest_r = RESP_DIM * threadIdx.y + r_offset,
+				dest_c = RESP_DIM * threadIdx.x + c_offset;
+			if (dest_r >= 0 && dest_r < SH_DIM && dest_c >= 0 && dest_c < SH_DIM) {
+				shared[dest_r][dest_c][0] = base_of_pixel[0];
+				shared[dest_r][dest_c][1] = base_of_pixel[1];
+				shared[dest_r][dest_c][2] = base_of_pixel[2];
+			}
+		}
+	}
+	__syncthreads();
+
+	if (r >= rows || c >= cols) return;
+
+	const unsigned char* base_of_pixel = &image[(r * cols + c) * 3];
+	float centroid_row = r,
+		centroid_col = c,
+		centroid_r = base_of_pixel[0],
+		centroid_g = base_of_pixel[1],
+		centroid_b = base_of_pixel[2];
+	const float radius_squared = radius * radius;
+	while (true) {
+		float new_r = 0, new_g = 0, new_b = 0, new_row = 0, new_col = 0;
+		int num_neighbors = 0;
+		for (int d_r = (int)floorf(-radius) - 1; d_r <= (int)ceilf(radius) + 1; d_r++) {
+			float limit = sqrtf(radius_squared - d_r * d_r);
+			for (int d_c = floorf(-limit); d_c <= ceilf(limit); d_c++) {
+				if (d_r * d_r + d_c * d_c > radius_squared) continue;
+				const float float_r = centroid_row + d_r, float_c = centroid_col + d_c;
+				if (float_r < 0 || float_r >= rows || float_c < 0 || float_c >= cols) {
+					continue;
+				}
+				const int search_r = (int)floorf(float_r), search_c = (int)floorf(float_c);
+				float potential_r, potential_g, potential_b;
+				const int shared_r = search_r - 32 * blockIdx.y + SH_PAD,
+					shared_c = search_c - 32 * blockIdx.x + SH_PAD;
+				if (shared_r >= 0 && shared_r < SH_DIM && shared_c >= 0 && shared_c < SH_DIM) {
+					potential_r = shared[shared_r][shared_c][0];
+					potential_g = shared[shared_r][shared_c][1];
+					potential_b = shared[shared_r][shared_c][2];
+				}
+				else {
+					base_of_pixel = &image[(search_r * cols + search_c) * 3];
+					potential_r = base_of_pixel[0];
+					potential_g = base_of_pixel[1];
+					potential_b = base_of_pixel[2];
+				}
+				const float delta_r = potential_r - centroid_r;
+				const float delta_g = potential_g - centroid_g;
+				const float delta_b = potential_b - centroid_b;
+				const float delta_row = search_r - centroid_row;
+				const float delta_col = search_c - centroid_col;
+				if (delta_r * delta_r + delta_g * delta_g + delta_b * delta_b + delta_row * delta_row + delta_col * delta_col <= radius_squared) {
+					num_neighbors++;
+					new_r += potential_r;
+					new_g += potential_g;
+					new_b += potential_b;
+					new_row += search_r;
+					new_col += search_c;
+				}
+			}
+		}
+		new_r /= num_neighbors;
+		new_g /= num_neighbors;
+		new_b /= num_neighbors;
+		new_row /= num_neighbors;
+		new_col /= num_neighbors;
+		const float delta_r = new_r - centroid_r;
+		const float delta_g = new_g - centroid_g;
+		const float delta_b = new_b - centroid_b;
+		const float delta_row = new_row - centroid_row;
+		const float delta_col = new_col - centroid_col;
+		float distance_squared = delta_r * delta_r + delta_g * delta_g + delta_b * delta_b + delta_row * delta_row + delta_col * delta_col;
+		centroid_r = new_r;
+		centroid_g = new_g;
+		centroid_b = new_b;
+		centroid_row = new_row;
+		centroid_col = new_col;
+		if (distance_squared <= convergence_threshold) {
+			break;
+		}
+	}
+	if constexpr (SyncBeforeReturn) {
+		__syncthreads();
+	}
+	centroids[r * cols + c].r = centroid_r;
+	centroids[r * cols + c].g = centroid_g;
+	centroids[r * cols + c].b = centroid_b;
+	centroids[r * cols + c].row = centroid_row;
+	centroids[r * cols + c].col = centroid_col;
+	
+}
+
 template <size_t SH_PAD>
 __global__ void split_image_shmem(const unsigned char* const RESTRICT reds, const unsigned char* const RESTRICT greens, const unsigned char* const RESTRICT blues, const int rows, const int cols, const float radius, Point* const centroids, const float convergence_threshold) {
 	const int c = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y * blockDim.y + threadIdx.y;
@@ -1197,7 +1304,7 @@ unsigned char* split_image_driver(const unsigned char* image_data, int rows, int
 	return result;
 }
 
-template <size_t SH_PAD>
+template <size_t SH_PAD, bool EarlyReturn = true, bool SyncBeforeReturn = false>
 unsigned char* loop_driver(const unsigned char* image_data, int rows, int cols, float radius, float convergence_threshold, bool do_color) {
 	unsigned char* result = (unsigned char*)malloc(rows * cols * 3);
 	int* cluster_ids = (int*)malloc(rows * cols * sizeof(int));
@@ -1215,8 +1322,10 @@ unsigned char* loop_driver(const unsigned char* image_data, int rows, int cols, 
 	dim3 grid_dims((cols + 31) / 32, (rows + 31) / 32);
 	if constexpr (SH_PAD == 0) {
 		kernel_with_loop << <grid_dims, block_dims >> > (dev_image, rows, cols, radius, dev_centroids, convergence_threshold * convergence_threshold);
-	} else {
+	} else if constexpr (EarlyReturn) {
 		kernel_with_loop_and_shmem<SH_PAD> << <grid_dims, block_dims >> > (dev_image, rows, cols, radius, dev_centroids, convergence_threshold * convergence_threshold);
+	} else {
+		kernel_with_loop_and_shmem_and_late_return<SH_PAD, SyncBeforeReturn> << <grid_dims, block_dims >> > (dev_image, rows, cols, radius, dev_centroids, convergence_threshold * convergence_threshold);
 	}
 	
 
@@ -1250,10 +1359,10 @@ unsigned char* loop_driver(const unsigned char* image_data, int rows, int cols, 
 	return result;
 }
 
-template <KernelType WhichKernel, bool EarlyStop = true, size_t SH_PAD = 48, bool UseAtomics = true>
+template <KernelType WhichKernel, bool EarlyStop = true, size_t SH_PAD = 48, bool UseAtomics = true, bool EarlyReturn = true, bool SyncBeforeReturn>
 unsigned char * GPU_driver(const unsigned char *image_data, int rows, int cols, float radius, float convergence_threshold, bool do_color) {
 	if constexpr (WhichKernel == Loop) {
-		return loop_driver<SH_PAD>(image_data, rows, cols, radius, convergence_threshold, do_color);
+		return loop_driver<SH_PAD, EarlyReturn, SyncBeforeReturn>(image_data, rows, cols, radius, convergence_threshold, do_color);
 	} else if constexpr (WhichKernel == SplitImage) {
 		return split_image_driver<SH_PAD>(image_data, rows, cols, radius, convergence_threshold, do_color);
 	}
@@ -1403,7 +1512,7 @@ void timings(const char* filename, float radius, float convergence_threshold, in
 		start = std::chrono::high_resolution_clock::now(); \
 		stmt; \
 		end = std::chrono::high_resolution_clock::now(); \
-		printf("%lld, ", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count()); \
+		printf("%lld\t", std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count()); \
 	} \
 	printf("\n"); \
 } while (0)
@@ -1422,17 +1531,20 @@ void timings(const char* filename, float radius, float convergence_threshold, in
 	//TIME("Shmem, pad=8         ", (GPU_driver<Shmem, false, 8, false>(image_data, rows, cols, radius, convergence_threshold, false)));
 	//TIME("no deltas            ", (GPU_driver<NoDeltas, false, 0, false>(image_data, rows, cols, radius, convergence_threshold, false)));
 	//TIME("no deltas, no atomics", GPU_driver<NoDeltas>(image_data, rows, cols, radius, convergence_threshold, false));
-	TIME("kernel loop, no shmem", (GPU_driver<Loop, false, 0, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("kernel loop, no shmem", (GPU_driver<Loop, false, 0, false>(image_data, rows, cols, radius, convergence_threshold, false)));
 	//TIME("kernel loop, shmem=48", (GPU_driver<Loop, false, 48, false>(image_data, rows, cols, radius, convergence_threshold, false)));
 	//TIME("kernel loop, shmem=32", (GPU_driver<Loop, false, 32, false>(image_data, rows, cols, radius, convergence_threshold, false)));
 	//TIME("kernel loop, shmem=16", (GPU_driver<Loop, false, 16, false>(image_data, rows, cols, radius, convergence_threshold, false)));
 	//TIME("kernel loop, shmem=8 ", (GPU_driver<Loop, false, 8, false>(image_data, rows, cols, radius, convergence_threshold, false)));
-	TIME("split image, shmem=32", (GPU_driver<SplitImage, false, 32, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("kernel loop, shmem=29", (GPU_driver<Loop, false, 29, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("split image, shmem=32", (GPU_driver<SplitImage, false, 32, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("loop, shmem, late ret", (GPU_driver<Loop, false, 32, false, false, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	TIME("loop, shmem, sync ret", (GPU_driver<Loop, false, 32, false, false, true>(image_data, rows, cols, radius, convergence_threshold, false)));
 }
 int main()
 {
 	//timings("test_images/dapper_lad_smaller.jpg", 50, 10, 10, true);
-	timings("test_images/dapper_lad.jpg", 50, 5, 10, true);
+	//timings("test_images/dapper_lad.jpg", 50, 5, 10, true);
 	timings("test_images/campus.jpg", 40, 5, 10, true);
 	timings("test_images/fruit_1000x562.jpg", 65, 3, 10, false);
 	timings("test_images/eas_1500x1000.jpg", 60, 10, 10, false);
@@ -1468,7 +1580,10 @@ int main()
 	WRITE_IMG("no_atomics_output.png", GPU_driver<NoDeltas>(image_data, rows, cols, radius, convergence_threshold, true));*/
 	
 	//WRITE_IMG("fruit_65_3.png", GPU_driver<NoDeltas>(image_data, rows, cols, 65, 3, true));
-	WRITE_IMG("split_output.png", (GPU_driver<SplitImage, false, 32, false>(image_data, rows, cols, radius, convergence_threshold, true)));
+	
+	WRITE_IMG("late_return_output.png", (GPU_driver<Loop, false, 32, false, false, true>(image_data, rows, cols, 50, 5, true)));
+
+	//WRITE_IMG("split_output.png", (GPU_driver<SplitImage, false, 32, false>(image_data, rows, cols, radius, convergence_threshold, true)));
 
 	//WRITE_IMG("radius_60_threshold_1.png", GPU_driver<NoDeltas>(image_data, rows, cols, 60, 1, true));
 	//WRITE_IMG("radius_60_threshold_5.png", GPU_driver<NoDeltas>(image_data, rows, cols, 60, 5, true));

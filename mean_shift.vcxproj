@@ -68,7 +68,7 @@
       <Include>D:\cs677\opencv\build\include</Include>
       <GenerateLineInfo>false</GenerateLineInfo>
       <InterleaveSourceInPTX>true</InterleaveSourceInPTX>
-      <AdditionalOptions>-res-usage %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>-res-usage --std=c++17 %(AdditionalOptions)</AdditionalOptions>
       <MaxRegCount>64</MaxRegCount>
       <CodeGeneration>compute_75,sm_75</CodeGeneration>
     </CudaCompile>
@@ -95,7 +95,7 @@
       <TargetMachinePlatform>64</TargetMachinePlatform>
       <AdditionalCompilerOptions>/openmp</AdditionalCompilerOptions>
       <Include>D:\cs677\opencv\build\include</Include>
-      <AdditionalOptions>-res-usage %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>-res-usage --std=c++17 %(AdditionalOptions)</AdditionalOptions>
       <CodeGeneration>compute_75,sm_75</CodeGeneration>
     </CudaCompile>
   </ItemDefinitionGroup>

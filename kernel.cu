@@ -65,9 +65,14 @@ struct kdres* neighbors(struct kdtree* kd, Point p, float radius) {
 //Still have to call neighbors before, and kd_res_free after this
 #define KD_FOR(point, set) for (kd_res_itemf(set, &point.r); !kd_res_end(set); kd_res_next(set), kd_res_itemf(set, &point.r))
 
-void color_result(const unsigned char *, unsigned char *, int *, int, int, int);
+struct ClusterResult {
+	int *data;
+	int num_clusters;
+};
+
+unsigned char* color_result(const unsigned char*, ClusterResult, int, int);
+
 unsigned char * cpu_version(const unsigned char* image_data, int rows, int cols, float radius, float convergence_threshold, bool do_color) {
-    unsigned char* result = (unsigned char*)malloc(rows * cols * 3);
 	int* cluster_ids = (int*)malloc(rows * cols * sizeof(int));
     struct kdtree* kd = kd_create(5);
     for (int r = 0; r < rows; r++) {
@@ -137,8 +142,12 @@ unsigned char * cpu_version(const unsigned char* image_data, int rows, int cols,
 	//fprintf(stderr, "Max iters in CPU version was %d\n", max_iters);
 	
 	//now compute average rgb for each cluster
+	unsigned char* result;
 	if (do_color) {
-		color_result(image_data, result, cluster_ids, cluster_convergences.size(), rows, cols);
+		ClusterResult clusters;
+		clusters.data = cluster_ids;
+		clusters.num_clusters = cluster_convergences.size();
+		result = color_result(image_data, clusters, rows, cols);
 	}
 	free(cluster_ids);
 	return result;
@@ -206,15 +215,16 @@ unsigned char* cpu_version_omp(const unsigned char* image_data, int rows, int co
 	
 	unsigned char *result = nullptr;
 	if (do_color) {
-		result = (unsigned char*)malloc(rows * cols * 3);
-		color_result(image_data, result, cluster_ids, cluster_convergences.size(), rows, cols);
+		ClusterResult clusters;
+		clusters.data = cluster_ids;
+		clusters.num_clusters = cluster_convergences.size();
+		result = color_result(image_data, clusters, rows, cols);
 	}
 	free(cluster_ids);
 	return result;
 }
 
 unsigned char *cpu_version_with_trajectories(const unsigned char *image_data, int rows, int cols, float radius, float convergence_threshold, bool do_color) {
-	unsigned char* result = (unsigned char*)malloc(rows * cols * 3);
 	int* cluster_ids = (int*)malloc(rows * cols * sizeof(int));
     struct kdtree* source_points = kd_create(5);
     for (int r = 0; r < rows; r++) {
@@ -301,20 +311,27 @@ unsigned char *cpu_version_with_trajectories(const unsigned char *image_data, in
 	kd_free(endpoints);
 	kd_free(source_points);
 	
-	if (do_color) color_result(image_data, result, cluster_ids, cluster_convergences.size(), rows, cols);
+	unsigned char* result = nullptr;
+	if (do_color) {
+		ClusterResult clusters;
+		clusters.data = cluster_ids;
+		clusters.num_clusters = cluster_convergences.size();
+		result = color_result(image_data, clusters, rows, cols);
+	}
 	free(cluster_ids);
 	return result;
 }
 
-void color_result(const unsigned char *image_data, unsigned char *result, int *cluster_ids, int num_clusters, int rows, int cols) {
-	std::vector<long long> average_rs(num_clusters),
-							average_gs(num_clusters),
-							average_bs(num_clusters);
-	std::vector<int> cluster_sizes(num_clusters);
+unsigned char * color_result(const unsigned char *image_data, ClusterResult clusters, int rows, int cols) {
+	unsigned char *result = (unsigned char *)malloc(rows * cols * 3);
+	std::vector<long long> average_rs(clusters.num_clusters),
+							average_gs(clusters.num_clusters),
+							average_bs(clusters.num_clusters);
+	std::vector<int> cluster_sizes(clusters.num_clusters);
 	//fprintf(stderr, "%d clusters\n", num_clusters);
 	for (int r = 0; r < rows; r++) {
 		for (int c = 0; c < cols; c++) {
-			int cluster_num = cluster_ids[r * cols + c];
+			int cluster_num = clusters.data[r * cols + c];
 			cluster_sizes[cluster_num]++;
 			const unsigned char * const base_of_pixel = &image_data[(r * cols + c) * 3];
 			average_rs[cluster_num] += base_of_pixel[0];
@@ -322,7 +339,7 @@ void color_result(const unsigned char *image_data, unsigned char *result, int *c
 			average_bs[cluster_num] += base_of_pixel[2];
 		}
 	}
-	for (int i = 0; i < num_clusters; i++) {
+	for (int i = 0; i < clusters.num_clusters; i++) {
 		average_rs[i] /= cluster_sizes[i];
 		average_gs[i] /= cluster_sizes[i];
 		average_bs[i] /= cluster_sizes[i];
@@ -330,12 +347,13 @@ void color_result(const unsigned char *image_data, unsigned char *result, int *c
 	for (int r = 0; r < rows; r++) {
 		for (int c = 0; c < cols; c++) {
 			char unsigned * const base_of_result_pixel = &result[(r * cols + c) * 3];
-			int cluster_num = cluster_ids[r * cols + c];
+			int cluster_num = clusters.data[r * cols + c];
 			base_of_result_pixel[0] = average_rs[cluster_num];
 			base_of_result_pixel[1] = average_gs[cluster_num];
 			base_of_result_pixel[2] = average_bs[cluster_num];
 		}
 	}
+	return result;
 }
 
 void naive_kernel_internals(const unsigned char* image, int rows, int cols, int r, int c, float radius, Point* centroids, bool *need_more_iter, float convergence_threshold) {
@@ -601,54 +619,6 @@ __global__ void shmem_kernel(const unsigned char * const RESTRICT image, const i
 	this_centroid->col = new_col;
 
 	deltas[r * cols + c] = distance_squared;
-}
-
-unsigned char* sequential_gpu_version(const unsigned char* image_data, int rows, int cols, float radius, float convergence_threshold, bool do_color) {
-	unsigned char *result = (unsigned char*)malloc(rows * cols * 3);
-	int* cluster_ids = (int*)malloc(rows * cols * sizeof(int));
-	Point *centroids = (Point*)malloc(rows * cols * sizeof(Point));
-	for (int r = 0; r < rows; r++){
-		for (int c = 0; c < cols; c++) {
-			const unsigned char* const base_of_pixel = &image_data[(r * cols + c) * 3];
-			centroids[r * cols + c] = Point(base_of_pixel[0], base_of_pixel[1], base_of_pixel[2], r, c);
-		}
-	}
-	
-	int iters = 0;
-	for (; ; iters++) {
-		bool need_more_iter = false;
-		//#pragma omp parallel for
-		for (int r = 0; r < rows; r++) {
-			for (int c = 0; c < cols; c++) {
-				naive_kernel_internals(image_data, rows, cols, r, c, radius, centroids, &need_more_iter, convergence_threshold);
-			}
-		}
-		if (!need_more_iter) break;
-	}
-	
-	std::vector<Point> cluster_convergences;
-	cluster_convergences.reserve(256);
-	for (int r = 0; r < rows; r++) {
-		for (int c = 0; c < cols; c++) {
-			int cluster_id = -1;
-			for (int i = 0; i < cluster_convergences.size(); i++) {
-				if (cluster_convergences[i].distance_squared(&centroids[r * cols + c]) <= 4 * convergence_threshold * convergence_threshold) {
-					cluster_id = i;
-					break;
-				}
-			}
-			if (cluster_id == -1) {
-				cluster_convergences.push_back(centroids[r * cols + c]);
-				cluster_id = (int)cluster_convergences.size() - 1;
-			}
-			cluster_ids[r * cols + c] = cluster_id;
-		}
-	}
-	if (do_color) color_result(image_data, result, cluster_ids, cluster_convergences.size(), rows, cols);
-	
-	free(cluster_ids);
-	free(centroids);
-	return result;
 }
 
 __global__ void max_in_groups(float* data, int n) {
@@ -1236,7 +1206,7 @@ __global__ void split_image_shmem(const unsigned char* const RESTRICT reds, cons
 	}
 }
 
-enum KernelType {
+enum CentroidMethod {
 	First,
 	RegPoints,
 	Shmem,
@@ -1245,13 +1215,17 @@ enum KernelType {
 	SplitImage
 };
 
+enum ClusterMethod {
+	None,
+	CPU
+};
+
+//Returns a DEVICE pointer to the centroids
 template <size_t SH_PAD>
-unsigned char* split_image_driver(const unsigned char* image_data, int rows, int cols, float radius, float convergence_threshold, bool do_color) {
-	unsigned char* result = do_color ? (unsigned char*)malloc(rows * cols * 3) : nullptr;
-	int* cluster_ids = (int*)malloc(rows * cols * sizeof(int));
+Point* split_image_driver(const unsigned char* image_data, int rows, int cols, float radius, float convergence_threshold) {
+	static_assert(SH_PAD != 0, "Split Image only implemented with shmem");
 	cudaError_t err_code = cudaSuccess;
 	err_code = cudaSetDevice(0);
-	Point* host_centroids = (Point*)malloc(rows * cols * sizeof(Point));
 	Point* dev_centroids = nullptr;
 	err_code = cudaMalloc((void**)&dev_centroids, rows * cols * sizeof(Point));
 
@@ -1275,42 +1249,15 @@ unsigned char* split_image_driver(const unsigned char* image_data, int rows, int
 	dim3 grid_dims((cols + 31) / 32, (rows + 31) / 32);
 	split_image_shmem<SH_PAD> << <grid_dims, block_dims >> > (dev_reds, dev_greens, dev_blues, rows, cols, radius, dev_centroids, convergence_threshold * convergence_threshold);
 
-	err_code = cudaMemcpy(host_centroids, dev_centroids, rows * cols * sizeof(Point), cudaMemcpyDeviceToHost);
-	std::vector<Point> cluster_convergences;
-	cluster_convergences.reserve(256);
-	for (int r = 0; r < rows; r++) {
-		for (int c = 0; c < cols; c++) {
-			int cluster_id = -1;
-			for (int i = 0; i < cluster_convergences.size(); i++) {
-				if (cluster_convergences[i].distance_squared(&host_centroids[r * cols + c]) <= 4 * convergence_threshold * convergence_threshold) {
-					cluster_id = i;
-					break;
-				}
-			}
-			if (cluster_id == -1) {
-				cluster_convergences.push_back(host_centroids[r * cols + c]);
-				cluster_id = cluster_convergences.size() - 1;
-			}
-			cluster_ids[r * cols + c] = cluster_id;
-		}
-	}
-	if (do_color) color_result(image_data, result, cluster_ids, cluster_convergences.size(), rows, cols);
-
-	free(host_centroids);
-	cudaFree(dev_centroids);
 	cudaFree(dev_reds); cudaFree(dev_greens); cudaFree(dev_blues);
-	free(cluster_ids);
-	(void)err_code;
-	return result;
+	return dev_centroids;
 }
 
+//Returns a DEVICE pointer to the centroids
 template <size_t SH_PAD, bool EarlyReturn = true, bool SyncBeforeReturn = false>
-unsigned char* loop_driver(const unsigned char* image_data, int rows, int cols, float radius, float convergence_threshold, bool do_color) {
-	unsigned char* result = (unsigned char*)malloc(rows * cols * 3);
-	int* cluster_ids = (int*)malloc(rows * cols * sizeof(int));
+Point * loop_driver(const unsigned char* image_data, int rows, int cols, float radius, float convergence_threshold) {
 	cudaError_t err_code = cudaSuccess;
 	err_code = cudaSetDevice(0);
-	Point* host_centroids = (Point*)malloc(rows * cols * sizeof(Point));
 	Point* dev_centroids = NULL;
 	err_code = cudaMalloc((void**)&dev_centroids, rows * cols * sizeof(Point));
 
@@ -1328,61 +1275,32 @@ unsigned char* loop_driver(const unsigned char* image_data, int rows, int cols, 
 		kernel_with_loop_and_shmem_and_late_return<SH_PAD, SyncBeforeReturn> << <grid_dims, block_dims >> > (dev_image, rows, cols, radius, dev_centroids, convergence_threshold * convergence_threshold);
 	}
 	
-
-	err_code = cudaMemcpy(host_centroids, dev_centroids, rows * cols * sizeof(Point), cudaMemcpyDeviceToHost);
-
-	std::vector<Point> cluster_convergences;
-	cluster_convergences.reserve(256);
-	for (int r = 0; r < rows; r++) {
-		for (int c = 0; c < cols; c++) {
-			int cluster_id = -1;
-			for (int i = 0; i < cluster_convergences.size(); i++) {
-				if (cluster_convergences[i].distance_squared(&host_centroids[r * cols + c]) <= 4 * convergence_threshold * convergence_threshold) {
-					cluster_id = i;
-					break;
-				}
-			}
-			if (cluster_id == -1) {
-				cluster_convergences.push_back(host_centroids[r * cols + c]);
-				cluster_id = cluster_convergences.size() - 1;
-			}
-			cluster_ids[r * cols + c] = cluster_id;
-		}
-	}
-	if (do_color) color_result(image_data, result, cluster_ids, cluster_convergences.size(), rows, cols);
-
-	free(host_centroids);
-	cudaFree(dev_centroids);
 	cudaFree(dev_image);
-	free(cluster_ids);
-	(void)err_code;
-	return result;
+	
+	return dev_centroids;
 }
 
-template <KernelType WhichKernel, bool EarlyStop = true, size_t SH_PAD = 48, bool UseAtomics = true, bool EarlyReturn = true, bool SyncBeforeReturn>
-unsigned char * GPU_driver(const unsigned char *image_data, int rows, int cols, float radius, float convergence_threshold, bool do_color) {
-	if constexpr (WhichKernel == Loop) {
-		return loop_driver<SH_PAD, EarlyReturn, SyncBeforeReturn>(image_data, rows, cols, radius, convergence_threshold, do_color);
-	} else if constexpr (WhichKernel == SplitImage) {
-		return split_image_driver<SH_PAD>(image_data, rows, cols, radius, convergence_threshold, do_color);
+//Returns a DEVICE pointer to the centroids
+template <CentroidMethod Method, bool EarlyStop, size_t SH_PAD, bool UseAtomics, bool EarlyReturn, bool SyncBeforeReturn>
+Point* convergence_driver(const unsigned char* image_data, int rows, int cols, float radius, float convergence_threshold) {
+	if constexpr (Method == Loop) {
+		return loop_driver<SH_PAD, EarlyReturn, SyncBeforeReturn>(image_data, rows, cols, radius, convergence_threshold);
+	} else if constexpr (Method == SplitImage) {
+		return split_image_driver<SH_PAD>(image_data, rows, cols, radius, convergence_threshold);
 	}
-	unsigned char *result = (unsigned char*)malloc(rows * cols * 3);
-	int* cluster_ids = (int*)malloc(rows * cols * sizeof(int));
-	cudaError_t err_code = cudaSuccess;
-	err_code = cudaSetDevice(0);
-	Point *host_centroids = (Point*)malloc(rows * cols * sizeof(Point));
-	for (int r = 0; r < rows; r++){
+	Point* host_centroids = (Point*)malloc(rows * cols * sizeof(Point));
+	for (int r = 0; r < rows; r++) {
 		for (int c = 0; c < cols; c++) {
 			const unsigned char* const base_of_pixel = &image_data[(r * cols + c) * 3];
 			host_centroids[r * cols + c] = Point(base_of_pixel[0], base_of_pixel[1], base_of_pixel[2], r, c);
 		}
 	}
-	Point *dev_centroids = NULL;
-	err_code = cudaMalloc((void**)&dev_centroids, rows * cols * sizeof(Point));
+	Point* dev_centroids = NULL;
+	cudaError_t err_code = cudaMalloc((void**)&dev_centroids, rows * cols * sizeof(Point));
 	err_code = cudaMemcpy(dev_centroids, host_centroids, rows * cols * sizeof(Point), cudaMemcpyHostToDevice);
-	
-	float *host_deltas = NULL, *dev_deltas = NULL;
-	if constexpr (WhichKernel != NoDeltas && WhichKernel != Loop) {
+
+	float* host_deltas = NULL, * dev_deltas = NULL;
+	if constexpr (Method != NoDeltas) {
 		host_deltas = (float*)malloc(rows * cols * sizeof(float));
 		for (int i = 0; i < rows * cols; i++) {
 			host_deltas[i] = INFINITY;
@@ -1391,30 +1309,20 @@ unsigned char * GPU_driver(const unsigned char *image_data, int rows, int cols, 
 		err_code = cudaMalloc((void**)&dev_deltas, rows * cols * sizeof(float));
 		err_code = cudaMemcpy(dev_deltas, host_deltas, rows * cols * sizeof(float), cudaMemcpyHostToDevice);
 	}
-	
-	
-	unsigned char *dev_image = NULL;
+
+	unsigned char* dev_image = NULL;
 	err_code = cudaMalloc((void**)&dev_image, rows * cols * 3);
 	err_code = cudaMemcpy(dev_image, image_data, rows * cols * 3, cudaMemcpyHostToDevice);
-	
-#ifdef TIME_ITERS
-	std::chrono::time_point<std::chrono::high_resolution_clock> start, end;
-#endif
 	for (int iters = 0; ; iters++) {
-#ifdef TIME_ITERS
-		start = std::chrono::high_resolution_clock::now();
-#endif
-		//fprintf(stderr, "now starting iter %d\n", iters++);
-		//My device (NVIDIA GeForce GTX 1660) has a max of 1024 threads per block
 		dim3 block_dims(32, 32);
-		dim3 grid_dims((cols + 31)/32, (rows + 31)/32);
-		if constexpr (WhichKernel == First) {
+		dim3 grid_dims((cols + 31) / 32, (rows + 31) / 32);
+		if constexpr (Method == First) {
 			first_kernel<EarlyStop><<<grid_dims, block_dims>>>(dev_image, rows, cols, radius, dev_centroids, dev_deltas, convergence_threshold * convergence_threshold);
-		} else if constexpr (WhichKernel == RegPoints) {
+		} else if constexpr (Method == RegPoints) {
 			reg_points_kernel<<<grid_dims, block_dims>>>(dev_image, rows, cols, radius, dev_centroids, dev_deltas, convergence_threshold * convergence_threshold);
-		} else if constexpr (WhichKernel == Shmem) {
+		} else if constexpr (Method == Shmem) {
 			shmem_kernel<SH_PAD><<<grid_dims, block_dims>>>(dev_image, rows, cols, radius, dev_centroids, dev_deltas, convergence_threshold * convergence_threshold);
-		} else if constexpr (WhichKernel == NoDeltas) {
+		} else if constexpr (Method == NoDeltas) {
 			int zero = 0;
 			err_code = cudaMemcpyToSymbol(need_more_iter, &zero, sizeof(int), 0, cudaMemcpyHostToDevice);
 			kernel_without_deltas<UseAtomics><<<grid_dims, block_dims>>>(dev_image, rows, cols, radius, dev_centroids, convergence_threshold * convergence_threshold);
@@ -1422,12 +1330,11 @@ unsigned char * GPU_driver(const unsigned char *image_data, int rows, int cols, 
 			fprintf(stderr, "Invalid Kernel specified\n");
 			abort();
 		}
-		
 #ifdef _DEBUG
 		err_code = cudaGetLastError(); //errors from launching the kernel
 		err_code = cudaDeviceSynchronize(); //errors that happened during the kernel launch
 #endif
-		if constexpr (WhichKernel != NoDeltas) {
+		if constexpr (Method != NoDeltas) {
 			int blocks_necessary = (int)ceil((float)(rows * cols) / 2048.0f); //1024 is max threads per block on my device
 			max_in_groups<<<blocks_necessary, 1024>>>(dev_deltas, rows * cols);
 #ifdef _DEBUG
@@ -1444,10 +1351,6 @@ unsigned char * GPU_driver(const unsigned char *image_data, int rows, int cols, 
 					break;
 				}
 			}
-#ifdef TIME_ITERS
-			end = std::chrono::high_resolution_clock::now();
-			printf("iter %d took %5ld ms\n", iters, std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count());
-#endif
 			if (all_below_threshold) {
 				break;
 			}
@@ -1458,11 +1361,29 @@ unsigned char * GPU_driver(const unsigned char *image_data, int rows, int cols, 
 				break;
 			}
 		}
-		
 	}
 	
-	err_code = cudaMemcpy(host_centroids, dev_centroids, rows * cols * sizeof(Point), cudaMemcpyDeviceToHost);
+	cudaFree(dev_deltas);
+	free(host_deltas);
+	cudaFree(dev_image);
+	free(host_centroids);
+	(void)err_code;
 	
+	return dev_centroids;
+}
+
+template <ClusterMethod Method>
+ClusterResult cluster_driver(int rows, int cols, float convergence_threshold, const Point *dev_centroids) {
+	ClusterResult result;
+	if constexpr (Method == None) {
+		result.data = nullptr;
+		result.num_clusters = 0;
+		return result;
+	}
+	Point *host_centroids = (Point*)malloc(rows * cols * sizeof(Point));
+	cudaError_t err_code = cudaMemcpy(host_centroids, dev_centroids, rows * cols * sizeof(Point), cudaMemcpyDeviceToHost);
+	cudaFree((void*)dev_centroids);
+	result.data = (int*)malloc(rows * cols * sizeof(int));
 	std::vector<Point> cluster_convergences;
 	cluster_convergences.reserve(256);
 	for (int r = 0; r < rows; r++) {
@@ -1478,20 +1399,18 @@ unsigned char * GPU_driver(const unsigned char *image_data, int rows, int cols, 
 				cluster_convergences.push_back(host_centroids[r * cols + c]);
 				cluster_id = cluster_convergences.size() - 1;
 			}
-			cluster_ids[r * cols + c] = cluster_id;
+			result.data[r * cols + c] = cluster_id;
 		}
 	}
-	if (do_color) color_result(image_data, result, cluster_ids, cluster_convergences.size(), rows, cols);
-	
-	free(host_centroids);
-	cudaFree(dev_centroids);
-	free(host_deltas);
-	cudaFree(dev_deltas);
-	cudaFree(dev_image);
-	free(cluster_ids);
-	(void)err_code;
+	result.num_clusters = cluster_convergences.size();
 	return result;
-	
+}
+
+template <CentroidMethod CentroidMethod, bool EarlyStop, size_t SH_PAD, bool UseAtomics, bool EarlyReturn, bool SyncBeforeReturn, ClusterMethod ClusterMethod>
+ClusterResult driver(const unsigned char* image_data, int rows, int cols, float radius, float convergence_threshold) {
+	Point* converged_centroids = convergence_driver<CentroidMethod, EarlyStop, SH_PAD, UseAtomics, EarlyReturn, SyncBeforeReturn>(image_data, rows, cols, radius, convergence_threshold);
+	ClusterResult clusters = cluster_driver<ClusterMethod>(rows, cols, convergence_threshold, converged_centroids);
+	return clusters;
 }
 
 void timings(const char* filename, float radius, float convergence_threshold, int iters, bool do_cpu_tests) {
@@ -1522,33 +1441,37 @@ void timings(const char* filename, float radius, float convergence_threshold, in
 		TIME("CPU with trajectories", cpu_version_with_trajectories(image_data, rows, cols, radius, convergence_threshold, false));
 		TIME("cylinder test, OMP   ", cpu_version_omp(image_data, rows, cols, radius, convergence_threshold, false));
 	}*/
-	//TIME("first kernel         ", (GPU_driver<First, false, 0, false>(image_data, rows, cols, radius, convergence_threshold, false)));
-	//TIME("with early stop      ", (GPU_driver<First, true, 0, false>(image_data, rows, cols, radius, convergence_threshold, false)));
-	//TIME("points in regs       ", GPU_driver<RegPoints>(image_data, rows, cols, radius, convergence_threshold, false));
-	//TIME("Shmem, pad=48        ", (GPU_driver<Shmem, false, 48, false>(image_data, rows, cols, radius, convergence_threshold, false)));
-	//TIME("Shmem, pad=32        ", (GPU_driver<Shmem, false, 32, false>(image_data, rows, cols, radius, convergence_threshold, false)));
-	//TIME("Shmem, pad=16        ", (GPU_driver<Shmem, false, 16, false>(image_data, rows, cols, radius, convergence_threshold, false)));
-	//TIME("Shmem, pad=8         ", (GPU_driver<Shmem, false, 8, false>(image_data, rows, cols, radius, convergence_threshold, false)));
-	//TIME("no deltas            ", (GPU_driver<NoDeltas, false, 0, false>(image_data, rows, cols, radius, convergence_threshold, false)));
-	//TIME("no deltas, no atomics", GPU_driver<NoDeltas>(image_data, rows, cols, radius, convergence_threshold, false));
-	//TIME("kernel loop, no shmem", (GPU_driver<Loop, false, 0, false>(image_data, rows, cols, radius, convergence_threshold, false)));
-	//TIME("kernel loop, shmem=48", (GPU_driver<Loop, false, 48, false>(image_data, rows, cols, radius, convergence_threshold, false)));
-	//TIME("kernel loop, shmem=32", (GPU_driver<Loop, false, 32, false>(image_data, rows, cols, radius, convergence_threshold, false)));
-	//TIME("kernel loop, shmem=16", (GPU_driver<Loop, false, 16, false>(image_data, rows, cols, radius, convergence_threshold, false)));
-	//TIME("kernel loop, shmem=8 ", (GPU_driver<Loop, false, 8, false>(image_data, rows, cols, radius, convergence_threshold, false)));
-	//TIME("kernel loop, shmem=29", (GPU_driver<Loop, false, 29, false>(image_data, rows, cols, radius, convergence_threshold, false)));
-	//TIME("split image, shmem=32", (GPU_driver<SplitImage, false, 32, false>(image_data, rows, cols, radius, convergence_threshold, false)));
-	//TIME("loop, shmem, late ret", (GPU_driver<Loop, false, 32, false, false, false>(image_data, rows, cols, radius, convergence_threshold, false)));
-	TIME("loop, shmem, sync ret", (GPU_driver<Loop, false, 32, false, false, true>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("naive CPU            ", cpu_version(image_data, rows, cols, radius, convergence_threshold, false));
+	//TIME("cylinder test, OMP   ", cpu_version_omp(image_data, rows, cols, radius, convergence_threshold, false));
+	//TIME("first kernel         ", (GPU_driver<First, false, 0, false, false, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("with early stop      ", (GPU_driver<First, true, 0, false, false, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("points in regs       ", (GPU_driver<RegPoints, false, 0, false, false, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("Shmem, pad=48        ", (GPU_driver<Shmem, false, 48, false, false, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("Shmem, pad=32        ", (GPU_driver<Shmem, false, 32, false, false, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("Shmem, pad=16        ", (GPU_driver<Shmem, false, 16, false, false, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("Shmem, pad=8         ", (GPU_driver<Shmem, false, 8, false, false, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("no deltas            ", (GPU_driver<NoDeltas, false, 0, true, false, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("no deltas, no atomics", (GPU_driver<NoDeltas, false, 0, false, false, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("kernel loop, no shmem", (GPU_driver<Loop, false, 0, false, false, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("kernel loop, shmem=48", (GPU_driver<Loop, false, 48, false, false, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("kernel loop, shmem=32", (GPU_driver<Loop, false, 32, false, false, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("kernel loop, shmem=16", (GPU_driver<Loop, false, 16, false, false, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("kernel loop, shmem=8 ", (GPU_driver<Loop, false, 8, false, false, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("split image, shmem=32", (GPU_driver<SplitImage, false, 32, false, false, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("loop, shmem, late ret", (GPU_driver<Loop, false, 32, false, true, false>(image_data, rows, cols, radius, convergence_threshold, false)));
+	//TIME("loop, shmem, sync ret", (GPU_driver<Loop, false, 32, false, true, true>(image_data, rows, cols, radius, convergence_threshold, false)));
 }
 int main()
 {
 	//timings("test_images/dapper_lad_smaller.jpg", 50, 10, 10, true);
 	//timings("test_images/dapper_lad.jpg", 50, 5, 10, true);
-	timings("test_images/campus.jpg", 40, 5, 10, true);
-	timings("test_images/fruit_1000x562.jpg", 65, 3, 10, false);
-	timings("test_images/eas_1500x1000.jpg", 60, 10, 10, false);
-	return;
+	//timings("test_images/campus.jpg", 40, 5, 10, true);
+	//timings("test_images/fruit_1000x562.jpg", 65, 3, 10, false);
+	//timings("test_images/eas_1500x1000.jpg", 60, 10, 10, false);
+	/*for (int thresh = 0; thresh <= 15; thresh++) {
+		timings("test_images/eas_1500x1000.jpg", 60, thresh, 10, false);
+	}*/
+	//return;
 
     int rows, cols, channels;
     unsigned char* image_data = (unsigned char*)stbi_load("test_images/dapper_lad.jpg", &cols, &rows, &channels, 3);
@@ -1556,8 +1479,19 @@ int main()
         fprintf(stderr, "Error reading image: %s\n", stbi_failure_reason());
         return -1;
     }
-#define WRITE_IMG(filename, stmt) do { \
-	unsigned char * result = stmt; \
+#define WRITE_IMG(filename, conv_config, cluster_config) do { \
+	static constexpr CentroidMethod centroid_method conv_config; \
+	static constexpr ClusterMethod cluster_method cluster_config; \
+	ClusterResult clusters = driver<&centroid_method, &cluster_method>(image_data, rows, cols, radius, convergence_threshold); \
+	unsigned char * result = color_result(image_data, clusters, rows, cols); \
+	stbi_write_png(filename, cols, rows, 3, result, 0); \
+	free(clusters.data); \
+	free(result); \
+} while (0)
+
+//Workaround so that I don't have to update the cpu versions
+#define WRITE_IMG_DIRECT(filename, stmt) do { \
+	unsigned char *result = stmt; \
 	stbi_write_png(filename, cols, rows, 3, result, 0); \
 	free(result); \
 } while (0)
@@ -1566,22 +1500,35 @@ int main()
 	//WRITE_IMG("gpu_output.png", GPU_driver<NoDeltas>(image_data, rows, cols, 50, 10, true));
 	
 	
-	/*WRITE_IMG("cpu_output.png", cpu_version(image_data, rows, cols, radius, convergence_threshold, true));
-	WRITE_IMG("cpu_traj_output.png", cpu_version_with_trajectories(image_data, rows, cols, radius, convergence_threshold, true));
+	//WRITE_IMG_DIRECT("cpu_output.png", cpu_version(image_data, rows, cols, radius, convergence_threshold, true));
+	//WRITE_IMG_DIRECT("cpu_traj_output.png", cpu_version_with_trajectories(image_data, rows, cols, radius, convergence_threshold, true));
 
-	WRITE_IMG("first_kernel_output.png", (GPU_driver<First, false, 0, false>(image_data, rows, cols, radius, convergence_threshold, true)));
-	WRITE_IMG("early_stop_output.png", (GPU_driver<First, true, 0, false>(image_data, rows, cols, radius, convergence_threshold, true)));
-	WRITE_IMG("reg_points_output.png", GPU_driver<RegPoints>(image_data, rows, cols, radius, convergence_threshold, true));
-	WRITE_IMG("shmem_pad_48_output.png", (GPU_driver<Shmem, false, 48, false>(image_data, rows, cols, radius, convergence_threshold, true)));
-	WRITE_IMG("Shmem_pad_32_output.png", (GPU_driver<Shmem, false, 32, false>(image_data, rows, cols, radius, convergence_threshold, true)));
-	WRITE_IMG("Shmem_pad_16_output.png", (GPU_driver<Shmem, false, 16, false>(image_data, rows, cols, radius, convergence_threshold, true)));
-	WRITE_IMG("Shmem_pad_8_output.png", (GPU_driver<Shmem, false, 8, false>(image_data, rows, cols, radius, convergence_threshold, true)));
-	WRITE_IMG("no_deltas_output.png", (GPU_driver<NoDeltas, false, 0, false>(image_data, rows, cols, radius, convergence_threshold, true)));
-	WRITE_IMG("no_atomics_output.png", GPU_driver<NoDeltas>(image_data, rows, cols, radius, convergence_threshold, true));*/
+#define WRITE_IMG(filename, stmt) do { \
+	ClusterResult result = stmt(image_data, rows, cols, radius, convergence_threshold); \
+	unsigned char *result_image = color_result(image_data, result, rows, cols); \
+	stbi_write_png(filename, cols, rows, 3, result_image, 0); \
+	free(result.data); \
+	free(result_image); \
+} while (0)
+
+	WRITE_IMG("output/first_kernel_output.png",  (driver<First, false, 0, false, false, false, CPU>));
+	WRITE_IMG("output/early_stop_output.png", (driver<First, true, 0, false, false, false, CPU>));
+	WRITE_IMG("output/reg_points_output.png", (driver<RegPoints, false, 0, false, false, false, CPU>));
+	WRITE_IMG("output/shmem_pad_48_output.png", (driver<Shmem, false, 48, false, false, false, CPU>));
+	WRITE_IMG("output/shmem_pad_32_output.png", (driver<Shmem, false, 32, false, false, false, CPU>));
+	WRITE_IMG("output/shmem_pad_16_output.png", (driver<Shmem, false, 16, false, false, false, CPU>));
+	WRITE_IMG("output/shmem_pad_8_output.png", (driver<Shmem, false, 8, false, false, false, CPU>));
+	WRITE_IMG("output/no_deltas_output.png", (driver<NoDeltas, false, 0, true, false, false, CPU>));
+	WRITE_IMG("output/no_atomics_output.png", (driver<NoDeltas, false, 0, false, false, false, CPU>));
+	WRITE_IMG("output/loop_output.png", (driver<Loop, false, 0, false, true, false, CPU>));
+	WRITE_IMG("output/loop_shmem_32_output.png", (driver<Loop, false, 32, false, true, false, CPU>));
+	WRITE_IMG("output/loop_shmem_32_late_ret_output.png", (driver<Loop, false, 32, false, false, false, CPU>));
+	WRITE_IMG("output/loop_shmem_32_sync_ret_output.png", (driver<Loop, false, 32, false, false, true, CPU>));
+	WRITE_IMG("output/split_image_shmem_32_output.png", (driver<SplitImage, false, 32, false, false, false, CPU>));
 	
 	//WRITE_IMG("fruit_65_3.png", GPU_driver<NoDeltas>(image_data, rows, cols, 65, 3, true));
 	
-	WRITE_IMG("late_return_output.png", (GPU_driver<Loop, false, 32, false, false, true>(image_data, rows, cols, 50, 5, true)));
+	//WRITE_IMG("late_return_output.png", (GPU_driver<Loop, false, 32, false, false, true>(image_data, rows, cols, 50, 5, true)));
 
 	//WRITE_IMG("split_output.png", (GPU_driver<SplitImage, false, 32, false>(image_data, rows, cols, radius, convergence_threshold, true)));
 

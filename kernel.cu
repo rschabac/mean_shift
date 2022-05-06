@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <chrono>
 #include <vector>
+#include <shared_mutex>
 #include <omp.h>
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -1216,7 +1217,10 @@ enum CentroidMethod {
 
 enum ClusterMethod {
 	None,
-	CPU
+	CPU,
+	KDTree,
+	KDTreeNeighborhood, //lower quality clusters
+	OMP //doesn't work
 };
 
 //Returns a DEVICE pointer to the centroids
@@ -1371,7 +1375,113 @@ Point* convergence_driver(const unsigned char* image_data, int rows, int cols, f
 	return dev_centroids;
 }
 
+template <bool UseNeighborhood>
+ClusterResult kdtree_clustering(int rows, int cols, float convergence_threshold, const Point* dev_centroids) {
+	ClusterResult result;
+	Point* host_centroids = (Point*)malloc(rows * cols * sizeof(Point));
+	cudaError_t err_code = cudaMemcpy(host_centroids, dev_centroids, rows * cols * sizeof(Point), cudaMemcpyDeviceToHost);
+	cudaFree((void*)dev_centroids);
+	result.data = (int*)malloc(rows * cols * sizeof(int));
+	/*
+	for each (r, c):
+		if there is a neighbor within 4 * thresh^2:
+			get that neighbor's id, and store this in result.data
+		else:
+			insert this point in the kd tree with the next cluster number
+			insert new cluster number in result.data
+	*/
+	kdtree* kd = kd_create(5);
+	int current_cluster_num = 0;
+	for (int r = 0; r < rows; r++) {
+		for (int c = 0; c < cols; c++) {
+			if constexpr (UseNeighborhood) {
+				Point* this_centroid = &host_centroids[r * cols + c];
+				kdres* neighbor_set = kd_nearest_rangef(kd, &this_centroid->r, 2 * convergence_threshold);
+				if (kd_res_size(neighbor_set) == 0) {
+					auto err = kd_insertf(kd, &this_centroid->r, (void*)current_cluster_num);
+					assert(err == 0);
+					result.data[r * cols + c] = current_cluster_num;
+					current_cluster_num++;
+				} else {
+					int cluster_num = (int)kd_res_item(neighbor_set, nullptr);
+					//There could be points with different clusters in neighbor_set
+					//If this is the case, those clusters are so close that choosing one randomly
+					//does not change the output image significantly.
+					result.data[r * cols + c] = cluster_num;
+				}
+				kd_res_free(neighbor_set);
+			} else {
+				Point* this_centroid = &host_centroids[r * cols + c];
+				kdres* neighbor_set = kd_nearestf(kd, &this_centroid->r);
+				if (!neighbor_set || kd_res_size(neighbor_set) == 0) {
+					auto err = kd_insertf(kd, &this_centroid->r, (void*)current_cluster_num);
+					assert(err == 0);
+					result.data[r * cols + c] = current_cluster_num;
+					current_cluster_num++;
+				}
+				else {
+					Point neighbor;
+					int possible_cluster_num = (int)kd_res_itemf(neighbor_set, &neighbor.r);
+					if (neighbor.distance_squared(this_centroid) < 4 * convergence_threshold * convergence_threshold) {
+						result.data[r * cols + c] = possible_cluster_num;
+					}
+					else {
+						auto err = kd_insertf(kd, &this_centroid->r, (void*)current_cluster_num);
+						assert(err == 0);
+						result.data[r * cols + c] = current_cluster_num;
+						current_cluster_num++;
+					}
+				}
+				if (neighbor_set) kd_res_free(neighbor_set);
+			}
+		}
+	}
+	kd_free(kd);
+	result.num_clusters = current_cluster_num;
+	return result;
+}
 
+ClusterResult omp_clustering(int rows, int cols, float convergence_threshold, const Point* dev_centroids) {
+	ClusterResult result;
+	Point* host_centroids = (Point*)malloc(rows * cols * sizeof(Point));
+	cudaError_t err_code = cudaMemcpy(host_centroids, dev_centroids, rows * cols * sizeof(Point), cudaMemcpyDeviceToHost);
+	cudaFree((void*)dev_centroids);
+	result.data = (int*)malloc(rows * cols * sizeof(int));
+	kdtree* kd = kd_create(5);
+	int current_cluster_num = 0;
+	std::shared_mutex rwlock;
+	#pragma omp parallel for collapse(2) schedule(dynamic)
+	for (int r = 0; r < rows; r++) {
+		for (int c = 0; c < cols; c++) {
+			Point* this_centroid = &host_centroids[r * cols + c];
+			rwlock.lock_shared();
+			kdres* neighbor_set = kd_nearestf(kd, &this_centroid->r);
+			if (!neighbor_set || kd_res_size(neighbor_set) == 0) {
+				if (neighbor_set) kd_res_free(neighbor_set);
+				rwlock.unlock_shared();
+				goto need_insert;
+			}
+			Point neighbor;
+			int possible_cluster_num = (int)kd_res_itemf(neighbor_set, &neighbor.r);
+			kd_res_free(neighbor_set);
+			rwlock.unlock_shared();
+			if (neighbor.distance_squared(this_centroid) < 4 * convergence_threshold * convergence_threshold) {
+				result.data[r * cols + c] = possible_cluster_num;
+				continue;
+			}
+		need_insert:
+			rwlock.lock();
+			auto err = kd_insertf(kd, &this_centroid->r, (void*)current_cluster_num);
+			int cluster_num = current_cluster_num++;
+			rwlock.unlock();
+			assert(err == 0);
+			result.data[r * cols + c] = cluster_num;
+		}
+	}
+	kd_free(kd);
+	result.num_clusters = current_cluster_num;
+	return result;
+}
 
 //expects a DEVICE Point *, will cudaFree it
 template <ClusterMethod Method>
@@ -1381,6 +1491,10 @@ ClusterResult cluster_driver(int rows, int cols, float convergence_threshold, co
 		result.data = nullptr;
 		result.num_clusters = 0;
 		return result;
+	} else if constexpr (Method == KDTree || Method == KDTreeNeighborhood) {
+		return kdtree_clustering<Method == KDTreeNeighborhood>(rows, cols, convergence_threshold, dev_centroids);
+	} else if constexpr (Method == OMP) {
+		return omp_clustering(rows, cols, convergence_threshold, dev_centroids);
 	}
 	Point *host_centroids = (Point*)malloc(rows * cols * sizeof(Point));
 	cudaError_t err_code = cudaMemcpy(host_centroids, dev_centroids, rows * cols * sizeof(Point), cudaMemcpyDeviceToHost);
@@ -1467,6 +1581,8 @@ void timings(const char* filename, float radius, float convergence_threshold, in
 		if (!dev_centroids_original) { \
 			dev_centroids_original = convergence_driver<Loop, false, 32, false, true, false>(image_data, rows, cols, radius, convergence_threshold); \
 		} \
+		fprintf(stderr, "starting %s %s\n", filename, name); \
+		printf("%s: ", name); \
 		unsigned long long time = 0; \
 		for (int i = 0; i < iters; i++) { \
 			fprintf(stderr, "%d, ", i); \
@@ -1505,23 +1621,25 @@ void timings(const char* filename, float radius, float convergence_threshold, in
 	//TIME("loop, shmem, late ret", (convergence_driver<Loop, false, 32, false, false, false>), (cluster_driver<None>));
 	//TIME("loop, shmem, sync ret", (convergence_driver<Loop, false, 32, false, false, true>), (cluster_driver<None>));
 
-	TIME_CLUSTERING("naive CPU clustering", (cluster_driver<CPU>));
+	//TIME_CLUSTERING("naive CPU clustering", (cluster_driver<CPU>));
+	TIME_CLUSTERING("kd tree", (cluster_driver<KDTree>));
+	TIME_CLUSTERING("kd tree, neighborhoods", (cluster_driver<KDTreeNeighborhood>));
 
 }
 int main()
 {
-	timings("test_images/dapper_lad_smaller.jpg", 50, 10, 10, true);
-	timings("test_images/dapper_lad.jpg", 50, 5, 10, true);
-	timings("test_images/campus.jpg", 40, 5, 10, true);
-	timings("test_images/fruit_1000x562.jpg", 65, 3, 10, false);
-	timings("test_images/eas_1500x1000.jpg", 60, 10, 10, false);
+	//timings("test_images/dapper_lad_smaller.jpg", 50, 10, 10, true);
+	//timings("test_images/dapper_lad.jpg", 50, 5, 10, true);
+	//timings("test_images/campus.jpg", 40, 5, 10, true);
+	//timings("test_images/fruit_1000x562.jpg", 65, 3, 10, false);
+	//timings("test_images/eas_1500x1000.jpg", 60, 10, 10, false);
 	/*for (int thresh = 0; thresh <= 15; thresh++) {
 		timings("test_images/eas_1500x1000.jpg", 60, thresh, 10, false);
 	}*/
 	//return;
 
     int rows, cols, channels;
-    unsigned char* image_data = (unsigned char*)stbi_load("test_images/dapper_lad.jpg", &cols, &rows, &channels, 3);
+    unsigned char* image_data = (unsigned char*)stbi_load("test_images/fruit_1000x562.jpg", &cols, &rows, &channels, 3);
     if (!image_data) {
         fprintf(stderr, "Error reading image: %s\n", stbi_failure_reason());
         return -1;
@@ -1533,7 +1651,7 @@ int main()
 	stbi_write_png(filename, cols, rows, 3, result, 0); \
 	free(result); \
 } while (0)
-	const float radius = 50, convergence_threshold = 10;
+	const float radius = 65, convergence_threshold = 3;
 	
 	//WRITE_IMG("gpu_output.png", GPU_driver<NoDeltas>(image_data, rows, cols, 50, 10, true));
 	
@@ -1543,6 +1661,7 @@ int main()
 
 #define WRITE_IMG(filename, stmt) do { \
 	ClusterResult result = stmt(image_data, rows, cols, radius, convergence_threshold); \
+	fprintf(stderr, "%d clusters\n", result.num_clusters); \
 	unsigned char *result_image = color_result(image_data, result, rows, cols); \
 	stbi_write_png(filename, cols, rows, 3, result_image, 0); \
 	free(result.data); \
@@ -1564,19 +1683,10 @@ int main()
 	//WRITE_IMG("output/loop_shmem_32_sync_ret_output.png", (driver<Loop, false, 32, false, false, true, CPU>));
 	//WRITE_IMG("output/split_image_shmem_32_output.png", (driver<SplitImage, false, 32, false, false, false, CPU>));
 	
-	//WRITE_IMG("fruit_65_3.png", GPU_driver<NoDeltas>(image_data, rows, cols, 65, 3, true));
-	
-	//WRITE_IMG("late_return_output.png", (GPU_driver<Loop, false, 32, false, false, true>(image_data, rows, cols, 50, 5, true)));
-
-	//WRITE_IMG("split_output.png", (GPU_driver<SplitImage, false, 32, false>(image_data, rows, cols, radius, convergence_threshold, true)));
-
-	//WRITE_IMG("radius_60_threshold_1.png", GPU_driver<NoDeltas>(image_data, rows, cols, 60, 1, true));
-	//WRITE_IMG("radius_60_threshold_5.png", GPU_driver<NoDeltas>(image_data, rows, cols, 60, 5, true));
-	//WRITE_IMG("radius_60_threshold_10.png", GPU_driver<NoDeltas>(image_data, rows, cols, 60, 10, true));
-	//WRITE_IMG("radius_60_threshold_50.png", GPU_driver<NoDeltas>(image_data, rows, cols, 60, 50, true));
-	//WRITE_IMG("radius_60_threshold_100.png", GPU_driver<NoDeltas>(image_data, rows, cols, 60, 100, true));
-
-	//WRITE_IMG("omp.png", cpu_version_omp(image_data, rows, cols, 50, 10, true));
+	//WRITE_IMG("output/CPU_clustering.png", (driver<Loop, false, 32, false, true, false, CPU>));
+	WRITE_IMG("output/KDTree_clustering.png", (driver<Loop, false, 32, false, true, false, KDTree>));
+	WRITE_IMG("output/KDTree_neighborhood_clustering.png", (driver<Loop, false, 32, false, true, false, KDTreeNeighborhood>));
+	WRITE_IMG("output/omp_clustering.png", (driver<Loop, false, 32, false, true, false, OMP>));
 	
 	stbi_image_free(image_data);
 

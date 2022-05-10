@@ -1,4 +1,0 @@
-Now timing on test_images/fruit_1000x562.jpg with radius 65.000000 and threshold 3.000000
-cylinder test, OMP   : 321623	321991	323817	321761	320626	323139	322784	322913	323093	323220	
-Now timing on test_images/eas_1500x1000.jpg with radius 60.000000 and threshold 10.000000
-cylinder test, OMP   : 259434	259678	259404	260072	260449	259983	259685	259648	259799	259578	

@@ -192,8 +192,8 @@ unsigned char* cpu_version_omp(const unsigned char* image_data, int rows, int co
 	
 	const float radius_squared = radius * radius;
 	const float threshold_squared = convergence_threshold * convergence_threshold;
-	std::vector<Point> cluster_convergences;
-	cluster_convergences.reserve(256);
+	kdtree* kd = kd_create(5);
+	int current_cluster_num = 0;
 	#pragma omp parallel for collapse(2) schedule(dynamic)
 	for (int r = 0; r < rows; r++) {
 		for (int c = 0; c < cols; c++) {
@@ -229,29 +229,38 @@ unsigned char* cpu_version_omp(const unsigned char* image_data, int rows, int co
 					break;
 				}
 			}
-			int cluster_id = -1;
 			#pragma omp critical
 			{
-				for (int i = 0; i < cluster_convergences.size(); i++) {
-					if (cluster_convergences[i].distance_squared(&centroid) <= 4 * convergence_threshold * convergence_threshold) {
-						cluster_id = i;
-						break;
+				kdres* neighbor_set = kd_nearestf(kd, &centroid.r);
+				if (!neighbor_set || kd_res_size(neighbor_set) == 0) {
+					auto err = kd_insertf(kd, &centroid.r, (void*)current_cluster_num);
+					assert(err == 0);
+					cluster_ids[r * cols + c] = current_cluster_num;
+					current_cluster_num++;
+				} else {
+					Point neighbor;
+					int possible_cluster_num = (int)kd_res_itemf(neighbor_set, &neighbor.r);
+					if (neighbor.distance_squared(&centroid) < 4 * convergence_threshold * convergence_threshold) {
+						cluster_ids[r * cols + c] = possible_cluster_num;
+					}
+					else {
+						auto err = kd_insertf(kd, &centroid.r, (void*)current_cluster_num);
+						assert(err == 0);
+						cluster_ids[r * cols + c] = current_cluster_num;
+						current_cluster_num++;
 					}
 				}
-				if (cluster_id == -1) {
-					cluster_convergences.push_back(centroid);
-					cluster_id = cluster_convergences.size() - 1;
-				}
+				if (neighbor_set) kd_res_free(neighbor_set);
 			}
-			cluster_ids[r * cols + c] = cluster_id;
 		}
 	}
+	kd_free(kd);
 	
 	unsigned char *result = nullptr;
 	if (do_color) {
 		ClusterResult clusters;
 		clusters.data = cluster_ids;
-		clusters.num_clusters = cluster_convergences.size();
+		clusters.num_clusters = current_cluster_num;
 		result = color_result(image_data, clusters, rows, cols);
 	}
 	free(cluster_ids);
@@ -1485,11 +1494,12 @@ ClusterResult omp_clustering(int rows, int cols, float convergence_threshold, co
 
 //expects a DEVICE Point *, will cudaFree it
 template <ClusterMethod Method>
-ClusterResult cluster_driver(int rows, int cols, float convergence_threshold, const Point *dev_centroids) {
+ClusterResult cluster_driver(int rows, int cols, float convergence_threshold, Point *dev_centroids) {
 	ClusterResult result;
 	if constexpr (Method == None) {
 		result.data = nullptr;
 		result.num_clusters = 0;
+		cudaFree(dev_centroids);
 		return result;
 	} else if constexpr (Method == KDTree || Method == KDTreeNeighborhood) {
 		return kdtree_clustering<Method == KDTreeNeighborhood>(rows, cols, convergence_threshold, dev_centroids);
@@ -1566,6 +1576,7 @@ void timings(const char* filename, float radius, float convergence_threshold, in
 		printf("%s: ", name); \
 		unsigned long long total = 0; \
 		for (int i = 0; i < iters; i++) { \
+			fprintf(stderr, "%d, ", i); \
 			start = std::chrono::high_resolution_clock::now(); \
 			unsigned char * result = stmt; \
 			end = std::chrono::high_resolution_clock::now(); \
@@ -1598,11 +1609,11 @@ void timings(const char* filename, float radius, float convergence_threshold, in
 		printf("clustering: %f\n", time / (float)iters); \
 	} while (0)
 
-	//if (do_cpu_tests) {
-	//	TIME_CPU("naive CPU            ", cpu_version(image_data, rows, cols, radius, convergence_threshold, false));
-	//	TIME_CPU("CPU with trajectories", cpu_version_with_trajectories(image_data, rows, cols, radius, convergence_threshold, false));
-	//	TIME_CPU("cylinder test, OMP   ", cpu_version_omp(image_data, rows, cols, radius, convergence_threshold, false));
-	//}
+	if (do_cpu_tests) {
+		TIME_CPU("naive CPU            ", cpu_version(image_data, rows, cols, radius, convergence_threshold, false));
+		TIME_CPU("CPU with trajectories", cpu_version_with_trajectories(image_data, rows, cols, radius, convergence_threshold, false));
+	}
+	//TIME_CPU("cylinder test, OMP   ", cpu_version_omp(image_data, rows, cols, radius, convergence_threshold, false));
 	//TIME("first_kernel", (convergence_driver<First, false, 0, false, false, false>), (cluster_driver<None>));
 	//TIME("early stop", (convergence_driver<First, true, 0, false, false, false>), (cluster_driver<None>));
 	//TIME("points in regs", (convergence_driver<RegPoints, false, 0, false, false, false>), (cluster_driver<None>));
@@ -1629,17 +1640,20 @@ void timings(const char* filename, float radius, float convergence_threshold, in
 int main()
 {
 	//timings("test_images/dapper_lad_smaller.jpg", 50, 10, 10, true);
-	//timings("test_images/dapper_lad.jpg", 50, 5, 10, true);
-	//timings("test_images/campus.jpg", 40, 5, 10, true);
+	//timings("test_images/dapper_lad.jpg", 50, 5, 10, false);
+	//timings("test_images/campus.jpg", 40, 5, 10, false);
 	//timings("test_images/fruit_1000x562.jpg", 65, 3, 10, false);
 	//timings("test_images/eas_1500x1000.jpg", 60, 10, 10, false);
+	timings("test_images/earth.jpg", 50, 1, 10, false);
+	timings("test_images/goose.jpg", 125, 30, 10);
+	timings("test_images/mountain.jpg", 125, 10, 10);
 	/*for (int thresh = 0; thresh <= 15; thresh++) {
 		timings("test_images/eas_1500x1000.jpg", 60, thresh, 10, false);
 	}*/
-	//return;
+	return;
 
     int rows, cols, channels;
-    unsigned char* image_data = (unsigned char*)stbi_load("test_images/fruit_1000x562.jpg", &cols, &rows, &channels, 3);
+    unsigned char* image_data = (unsigned char*)stbi_load("test_images/mountain.jpg", &cols, &rows, &channels, 3);
     if (!image_data) {
         fprintf(stderr, "Error reading image: %s\n", stbi_failure_reason());
         return -1;
@@ -1651,17 +1665,14 @@ int main()
 	stbi_write_png(filename, cols, rows, 3, result, 0); \
 	free(result); \
 } while (0)
-	const float radius = 65, convergence_threshold = 3;
-	
-	//WRITE_IMG("gpu_output.png", GPU_driver<NoDeltas>(image_data, rows, cols, 50, 10, true));
-	
+	float radius = 300, convergence_threshold = 5;
 	
 	//WRITE_IMG_DIRECT("cpu_output.png", cpu_version(image_data, rows, cols, radius, convergence_threshold, true));
 	//WRITE_IMG_DIRECT("cpu_traj_output.png", cpu_version_with_trajectories(image_data, rows, cols, radius, convergence_threshold, true));
+	//WRITE_IMG_DIRECT("output/omp.png", cpu_version_omp(image_data, rows, cols, radius, convergence_threshold, true));
 
 #define WRITE_IMG(filename, stmt) do { \
 	ClusterResult result = stmt(image_data, rows, cols, radius, convergence_threshold); \
-	fprintf(stderr, "%d clusters\n", result.num_clusters); \
 	unsigned char *result_image = color_result(image_data, result, rows, cols); \
 	stbi_write_png(filename, cols, rows, 3, result_image, 0); \
 	free(result.data); \
@@ -1684,9 +1695,11 @@ int main()
 	//WRITE_IMG("output/split_image_shmem_32_output.png", (driver<SplitImage, false, 32, false, false, false, CPU>));
 	
 	//WRITE_IMG("output/CPU_clustering.png", (driver<Loop, false, 32, false, true, false, CPU>));
-	WRITE_IMG("output/KDTree_clustering.png", (driver<Loop, false, 32, false, true, false, KDTree>));
-	WRITE_IMG("output/KDTree_neighborhood_clustering.png", (driver<Loop, false, 32, false, true, false, KDTreeNeighborhood>));
-	WRITE_IMG("output/omp_clustering.png", (driver<Loop, false, 32, false, true, false, OMP>));
+	//WRITE_IMG("output/KDTree_clustering.png", (driver<Loop, false, 32, false, true, false, KDTree>));
+	//WRITE_IMG("output/KDTree_neighborhood_clustering.png", (driver<Loop, false, 32, false, true, false, KDTreeNeighborhood>));
+	//WRITE_IMG("output/omp_clustering.png", (driver<Loop, false, 32, false, true, false, OMP>));
+
+	WRITE_IMG("output/300_5.png", (driver<Loop, false, 32, false, true, false, KDTree>));
 	
 	stbi_image_free(image_data);
 
